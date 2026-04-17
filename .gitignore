@@ -1,0 +1,7 @@
+.venv/
+data/
+output_SciBERT/
+output_specter2/
+.gemini/
+.env
+__pycache__/
