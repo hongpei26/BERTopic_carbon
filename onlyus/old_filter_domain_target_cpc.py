@@ -1,8 +1,9 @@
 import json
 from pathlib import Path
 
-src = Path("/home/carbon/carbon/dataa/global_allonlycpc/global_allonlycpc_dedup_by_abstract.json")
-out = Path("/home/carbon/carbon/dataa/global_allonlycpc/global_allonlycpc_domain_target_intersection.json")
+
+src = Path("/home/carbon/carbon/data/part-000000000000_dedup_by_abstract.json")
+out = Path("/home/carbon/carbon/data/part-000000000000_domain_target_intersection.json")
 
 
 DOMAIN_PREFIXES = [

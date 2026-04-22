@@ -31,7 +31,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = PROJECT_DIR / "output"
+OUTPUT_DIR = PROJECT_DIR / "output_specter2"
 
 
 def configure_huggingface_token() -> str | None:
@@ -508,7 +508,28 @@ def stage6_train_and_refine(
 # STAGE 7：Topics over Time 動態主題分析
 # =============================================================================
 
-def stage7_topics_over_time(topic_model, df, abstracts):
+def classify_trajectory(freq, shares):
+    first, second, third, latest = freq
+    early = first + second
+    late = third + latest
+    growth = (late - early) / (early + 1)
+    share_change = shares[-1] - shares[0]
+    peak_index = int(np.argmax(freq))
+
+    if latest >= max(freq[:3]) and growth > 0.3:
+        return "新興上升"
+    if peak_index <= 1 and growth < -0.3:
+        return "早期高峰後衰退"
+    if peak_index == 2 and latest < third:
+        return "中期高峰後回落"
+    if share_change > 0.03:
+        return "占比提升"
+    if share_change < -0.03:
+        return "占比下降"
+    return "相對穩定"
+
+
+def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
     """
     以 priority_date 切分的 4 個時間區段作為時間標籤，
     執行 Topics over Time 分析，輸出技術演進趨勢與生命週期狀態標記。
@@ -565,11 +586,11 @@ def stage7_topics_over_time(topic_model, df, abstracts):
         growth = (late - early) / (early + 1)
 
         if growth > 0.5 and freq[0] < freq[-1]:
-            status = "🌱 新興"
+            status = " 新興"
         elif growth < -0.3 and freq[0] > freq[-1]:
-            status = "📉 衰退"
+            status = " 衰退"
         else:
-            status = "✅ 成熟"
+            status = " 成熟"
 
         lifecycle_rows.append({
             "Topic_ID"   : tid,
@@ -592,9 +613,79 @@ def stage7_topics_over_time(topic_model, df, abstracts):
         output_dir / "topic_lifecycle.csv", index=False, encoding="utf-8-sig"
     )
     print(f"\n生命週期標記已儲存：topic_lifecycle.csv")
+
+    # ── 近 20 年演進軌跡輸出 ──────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("近 20 年技術演進軌跡分析")
+    print("=" * 60)
+
+    topic_df = df[df["topic_id"] != -1].copy()
+    topic_df["priority_year"] = topic_df["priority_date"].dt.year
+
+    yearly_counts = pd.crosstab(topic_df["priority_year"], topic_df["topic_id"])
+    yearly_counts = yearly_counts.reindex(range(2006, 2026), fill_value=0)
+    yearly_counts.to_csv(output_dir / "topic_yearly_counts.csv", encoding="utf-8-sig")
+
+    yearly_totals = yearly_counts.sum(axis=1).replace(0, np.nan)
+    yearly_shares = yearly_counts.div(yearly_totals, axis=0).fillna(0)
+    yearly_shares.to_csv(output_dir / "topic_yearly_shares.csv", encoding="utf-8-sig")
+
+    segment_counts = pd.crosstab(topic_df["topic_id"], topic_df["time_segment"])
+    segment_counts = segment_counts.reindex(columns=SEGMENTS, fill_value=0)
+    segment_counts.to_csv(output_dir / "topic_segment_counts.csv", encoding="utf-8-sig")
+
+    segment_totals = topic_df["time_segment"].value_counts().reindex(SEGMENTS, fill_value=0)
+    segment_shares = segment_counts.div(segment_totals.replace(0, np.nan), axis=1).fillna(0)
+    segment_shares.to_csv(output_dir / "topic_segment_shares.csv", encoding="utf-8-sig")
+
+    keyword_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Top10_Keywords"]))
+    count_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Doc_Count"]))
+
+    evolution_rows = []
+    segment_midpoints = np.array([2008, 2013, 2018, 2023], dtype=float)
+
+    for topic_id in sorted(segment_counts.index):
+        freq = [int(segment_counts.loc[topic_id, segment]) for segment in SEGMENTS]
+        shares = [float(segment_shares.loc[topic_id, segment]) for segment in SEGMENTS]
+        slope = float(np.polyfit(segment_midpoints, shares, 1)[0])
+        peak_idx = int(np.argmax(freq))
+        keywords = keyword_map.get(topic_id, "")
+
+        evolution_rows.append({
+            "Topic_ID": topic_id,
+            "Topic_Label": f"Topic_{topic_id}",
+            "Top10_Keywords": keywords,
+            "Doc_Count": int(count_map.get(topic_id, sum(freq))),
+            "Freq_2006_2010": freq[0],
+            "Freq_2011_2015": freq[1],
+            "Freq_2016_2020": freq[2],
+            "Freq_2021_2025": freq[3],
+            "Share_2006_2010": round(shares[0], 4),
+            "Share_2011_2015": round(shares[1], 4),
+            "Share_2016_2020": round(shares[2], 4),
+            "Share_2021_2025": round(shares[3], 4),
+            "Share_Change_2006_to_2025": round(shares[-1] - shares[0], 4),
+            "Share_Slope_Per_Year": round(slope, 6),
+            "Peak_Segment": SEGMENTS[peak_idx],
+            "Trajectory": classify_trajectory(freq, shares),
+        })
+
+    evolution_df = pd.DataFrame(evolution_rows)
+    evolution_df.to_csv(
+        output_dir / "topic_evolution_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print("演進軌跡檔案已儲存：")
+    print("  ├── topic_yearly_counts.csv")
+    print("  ├── topic_yearly_shares.csv")
+    print("  ├── topic_segment_counts.csv")
+    print("  ├── topic_segment_shares.csv")
+    print("  └── topic_evolution_summary.csv")
     print(f"\nSTAGE 7 完成\n")
 
-    return tot, lifecycle_df
+    return tot, lifecycle_df, evolution_df
 
 
 # =============================================================================
@@ -603,7 +694,7 @@ def stage7_topics_over_time(topic_model, df, abstracts):
 
 if __name__ == "__main__":
 
-    INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_domain_target_intersection.json")
+    INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_carbon_neutral_keywords.json")
     TARGET_TOPICS = 20
 
     # STAGE 1：載入與前處理
@@ -631,7 +722,9 @@ if __name__ == "__main__":
     )
 
     # STAGE 7：Topics over Time 動態分析
-    tot_df, lifecycle_df = stage7_topics_over_time(topic_model, df, abstracts)
+    tot_df, lifecycle_df, evolution_df = stage7_topics_over_time(
+        topic_model, df, abstracts, keywords_df
+    )
 
     print("=" * 60)
     print("全流程執行完畢")
@@ -641,4 +734,6 @@ if __name__ == "__main__":
     print("  ├── topic_keywords.csv")
     print("  ├── topics_over_time.csv")
     print("  └── topic_lifecycle.csv")
+    print("  ├── topic_evolution_summary.csv")
+    print("  └── topic_yearly_counts.csv / topic_yearly_shares.csv")
     print("=" * 60)

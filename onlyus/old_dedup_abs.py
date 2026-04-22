@@ -2,8 +2,8 @@ import json
 from pathlib import Path
 
 
-src = Path("/home/carbon/carbon/dataa/global_allonlycpc/global_allonlycpc_dedup.json")
-out = Path("/home/carbon/carbon/dataa/global_allonlycpc/global_allonlycpc_dedup_by_abstract.json")
+src = Path("/home/carbon/carbon/data/part-000000000000_dedup.json")
+out = Path("/home/carbon/carbon/data/part-000000000000_dedup_by_abstract.json")
 
 
 def date_sort_value(value):

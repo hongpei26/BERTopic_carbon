@@ -5,3 +5,5 @@ output_specter2/
 .gemini/
 .env
 __pycache__/
+output_specter2old/
+dataa/

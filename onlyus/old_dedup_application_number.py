@@ -3,17 +3,10 @@ import json
 import numpy as np
 from pathlib import Path
 
-src_dir = Path("/home/carbon/carbon/dataa/global_allonlycpc")
-out = Path("/home/carbon/carbon/dataa/global_allonlycpc/global_allonlycpc_dedup.json")
+src = Path("/home/carbon/carbon/data/part-000000000000.parquet")
+out = Path("/home/carbon/carbon/data/part-000000000000_dedup.json")
 
-parquet_files = sorted(src_dir.glob("*.parquet"))
-if not parquet_files:
-    raise FileNotFoundError(f"在 {src_dir} 找不到任何 .parquet 檔案")
-
-df = pd.concat(
-    [pd.read_parquet(path) for path in parquet_files],
-    ignore_index=True,
-)
+df = pd.read_parquet(src)
 
 # 保留原始順序，作為最後 tie-breaker
 df = df.reset_index(names="_original_order")

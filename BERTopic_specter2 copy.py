@@ -1,16 +1,17 @@
 # =============================================================================
 # 碳捕捉專利 BERTopic 動態主題建模 Pipeline(針對碳中和領域)
-# Stage 1–7：資料載入 → SciBERT → UMAP → HDBSCAN → c-TF-IDF → 主題優化 → TOT
+# Stage 1–7：資料載入 → SPECTER2 → UMAP → HDBSCAN → c-TF-IDF → 主題優化 → TOT
 # =============================================================================
 
 # ── 安裝套件（首次執行時取消註解）──────────────────────────────────────────
-# pip install bertopic sentence-transformers umap-learn hdbscan pandas pyarrow
+# pip install bertopic sentence-transformers umap-learn hdbscan pandas pyarrow adapters
 
 import re
 import json
 import warnings
 import pandas as pd
 import numpy as np
+import torch
 from pathlib import Path
 import os
 try:
@@ -20,7 +21,7 @@ except ImportError:
 
 
 
-from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
 from umap import UMAP
 from hdbscan import HDBSCAN
 from bertopic import BERTopic
@@ -30,7 +31,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = PROJECT_DIR / "output_SciBERT"
+OUTPUT_DIR = PROJECT_DIR / "output_specter2"
 
 
 def configure_huggingface_token() -> str | None:
@@ -205,45 +206,108 @@ def stage1_load_and_preprocess(input_path: str):
     df = df[df["time_segment"] != "OUT_OF_RANGE"].reset_index(drop=True)
 
     abstracts = df["abstract_clean"].tolist()
+    if "title_en" in df.columns:
+        embedding_texts = (
+            df["title_en"].fillna("").astype(str).str.strip()
+            + " [SEP] "
+            + df["abstract_en"].fillna("").astype(str).str.strip()
+        ).tolist()
+    else:
+        embedding_texts = df["abstract_en"].fillna("").astype(str).tolist()
 
     print("\n各時間區段樣本數：")
     print(df["time_segment"].value_counts().sort_index().to_string())
     print(f"\nSTAGE 1 完成，最終語料筆數：{len(df):,}\n")
 
-    return df, abstracts
+    return df, abstracts, embedding_texts
 
 
 # =============================================================================
-# STAGE 2：科學語義嵌入 (Scientific Embedding - SciBERT)
+# STAGE 2：科學語義嵌入 (Scientific Embedding - SPECTER2)
 # =============================================================================
 
-def stage2_embed(abstracts: list, batch_size: int = 64):
+class Specter2Embedder:
     """
-    使用 SciBERT 將 Abstract 轉化為 768 維語義向量。
-    精準捕捉冶金、化學反應（還原、電解）與工業術語。
+    使用 allenai/specter2_base 搭配 allenai/specter2 proximity adapter。
+    SPECTER2 官方建議用 title + abstract 產生科學文獻語義向量。
+    """
+
+    def __init__(self, token: str | None = None):
+        try:
+            from adapters import AutoAdapterModel
+        except ImportError as exc:
+            raise ImportError(
+                "使用 SPECTER2 需要先安裝 adapters："
+                "/home/carbon/carbon/.venv/bin/python -m pip install -U adapters"
+            ) from exc
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "allenai/specter2_base",
+            token=token,
+        )
+        self.model = AutoAdapterModel.from_pretrained(
+            "allenai/specter2_base",
+            token=token,
+        )
+        self.model.load_adapter(
+            "allenai/specter2",
+            source="hf",
+            load_as="specter2",
+            set_active=True,
+        )
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model.to(self.device)
+        self.model.eval()
+
+    def encode(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
+        embeddings = []
+        total = len(texts)
+
+        for start in range(0, total, batch_size):
+            batch = texts[start:start + batch_size]
+            inputs = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+                return_token_type_ids=False,
+                max_length=512,
+            )
+            inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+            with torch.no_grad():
+                output = self.model(**inputs)
+                batch_embeddings = output.last_hidden_state[:, 0, :].cpu().numpy()
+
+            embeddings.append(batch_embeddings)
+            print(f"  embedded {min(start + batch_size, total):,}/{total:,}")
+
+        return np.vstack(embeddings)
+
+
+def stage2_embed(embedding_texts: list, batch_size: int = 32):
+    """
+    使用 SPECTER2 將 title + abstract 轉化為 768 維語義向量。
     """
 
     print("=" * 60)
-    print("STAGE 2：SciBERT 語義嵌入")
+    print("STAGE 2：SPECTER2 語義嵌入")
     print("=" * 60)
 
-    model_name = "allenai/scibert_scivocab_uncased"
-    print(f"載入模型：{model_name}")
-    print("（首次執行需下載模型約 440MB，請耐心等候）\n")
+    base_model_name = "allenai/specter2_base"
+    adapter_name = "allenai/specter2"
+    print(f"載入 base model：{base_model_name}")
+    print(f"載入 adapter：{adapter_name}")
+    print("（首次執行需下載模型與 adapter，請耐心等候）\n")
 
     hf_token = configure_huggingface_token()
     if hf_token:
         print("已從 .env / 環境變數載入 Hugging Face token")
 
-    embedding_model = SentenceTransformer(model_name, token=hf_token)
+    embedding_model = Specter2Embedder(token=hf_token)
 
-    print(f"開始嵌入 {len(abstracts):,} 筆摘要（batch_size={batch_size}）...")
-    embeddings = embedding_model.encode(
-        abstracts,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        convert_to_numpy=True
-    )
+    print(f"開始嵌入 {len(embedding_texts):,} 筆 title + abstract（batch_size={batch_size}）...")
+    embeddings = embedding_model.encode(embedding_texts, batch_size=batch_size)
 
     print(f"\nSTAGE 2 完成，嵌入矩陣維度：{embeddings.shape}")
     print(f"（{embeddings.shape[0]:,} 筆 × {embeddings.shape[1]} 維）\n")
@@ -358,7 +422,7 @@ def stage6_train_and_refine(
 
     # ── 6.1 建立模型 ──────────────────────────────────────────────────────
     topic_model = BERTopic(
-        embedding_model=embedding_model,
+        embedding_model=None,  # 使用 stage2 預先計算的 SPECTER2 embeddings
         umap_model=umap_model,
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
@@ -543,10 +607,10 @@ if __name__ == "__main__":
     TARGET_TOPICS = 20
 
     # STAGE 1：載入與前處理
-    df, abstracts = stage1_load_and_preprocess(INPUT_PATH)
+    df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)
 
-    # STAGE 2：SciBERT 嵌入
-    embedding_model, embeddings = stage2_embed(abstracts, batch_size=64)
+    # STAGE 2：SPECTER2 嵌入
+    embedding_model, embeddings = stage2_embed(embedding_texts, batch_size=32)
 
     # STAGE 3：UMAP 降維設定
     umap_model = stage3_umap()
