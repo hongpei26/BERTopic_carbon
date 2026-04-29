@@ -3,8 +3,10 @@ import re
 from pathlib import Path
 
 
-src = Path("/home/carbon/carbon/data/part-000000000000_domain_target_intersection.json")
-out = Path("/home/carbon/carbon/data/part-000000000000_carbon_neutral_keywords.json")
+#src = Path("/home/carbon/carbon/data/part-000000000000_domain_target_intersection.json")
+src = Path("/home/carbon/carbon/data/cpc_domain_target_intersection_3.json")
+out = Path("/home/carbon/carbon/data/carbon_neutral_keywords_4.json")
+#out = Path("/home/carbon/carbon/data/part-000000000000_carbon_neutral_keywords.json")
 
 
 HIGH_RELEVANCE_TERMS = [
@@ -52,6 +54,7 @@ HIGH_RELEVANCE_TERMS = [
     "carbon neutral",
     "carbon footprint",
     "low carbon",
+    "renewable energy",
     "green steel",
     "greenhouse",
     "steel slag",
@@ -61,6 +64,9 @@ HIGH_RELEVANCE_TERMS = [
     "molten carbonate fuel cell",
     "carbonate fuel cell",
     "electrolysis",
+    "electrowinning",
+    "molten oxide electrolysis",
+    "molten oxide",
     "dri",
     "hbi",
     "hot briquetted iron",
@@ -114,25 +120,7 @@ MEDIUM_RELEVANCE_TERMS = [
     "by-product",
     "byproduct",
     "coproduct",
-    "electrowinning",
 ]
-
-LOW_RELEVANCE_TERMS = [
-    "molten steel",
-    "molten iron",
-    "molten metal",
-    "molten bath",
-    "pig iron",
-    "liquid pig iron",
-    "converter",
-    "ladle",
-    "decarburization",
-    "denitrification",
-    "desulfurizing",
-    "dephosphorization",
-    "basic oxygen furnace",
-]
-
 
 FILLER_WORDS = [
     "a",
@@ -181,7 +169,11 @@ HIGH_FLEXIBLE_PATTERNS = compile_flexible_patterns({
     "direct reduced iron": flexible_phrase_pattern("direct", "reduced", "iron", max_gap_words=1),
     "producing direct reduced iron": flexible_phrase_pattern("producing", "direct", "reduced", "iron", max_gap_words=1),
     "reducing gas": flexible_phrase_pattern("reducing", "gas", max_gap_words=2),
+    "reduction furnace": flexible_phrase_pattern("reduction", "furnace", max_gap_words=1),
+    "reduction reactor": flexible_phrase_pattern("reduction", "reactor", max_gap_words=1),
+    "reduction zone": flexible_phrase_pattern("reduction", "zone", max_gap_words=1),
     "reduction gas": flexible_phrase_pattern("reduction", "gas", max_gap_words=2),
+    "synthesis gas": flexible_phrase_pattern("synthesis", "gas", max_gap_words=1),
     "reformed gas": flexible_phrase_pattern("reformed", "gas", max_gap_words=2),
     "hot reducing gas": flexible_phrase_pattern("hot", "reducing", "gas", max_gap_words=2),
     "hydrogen rich": re.compile(
@@ -194,18 +186,35 @@ HIGH_FLEXIBLE_PATTERNS = compile_flexible_patterns({
     ),
     "blast furnace gas": flexible_phrase_pattern("blast", "furnace", "gas", max_gap_words=1),
     "blast furnace top gas": flexible_phrase_pattern("blast", "furnace", "top", "gas", max_gap_words=1),
+    "top gas": flexible_phrase_pattern("top", "gas", max_gap_words=1),
     "electric arc furnace": flexible_phrase_pattern("electric", "arc", "furnace", max_gap_words=1),
+    "electric furnace": flexible_phrase_pattern("electric", "furnace", max_gap_words=1),
     "cold iron source": flexible_phrase_pattern("cold", "iron", "source", max_gap_words=1),
     "carbon capture": flexible_phrase_pattern("carbon", "capture", max_gap_words=2),
+    "carbon dioxide": flexible_phrase_pattern("carbon", "dioxide", max_gap_words=1),
     "carbon negative": flexible_phrase_pattern("carbon", "negative", max_gap_words=2),
     "fixing carbon dioxide": flexible_phrase_pattern("fixing", "carbon", "dioxide", max_gap_words=2),
+    "carbon footprint": flexible_phrase_pattern("carbon", "footprint", max_gap_words=1),
+    "steel scrap": flexible_phrase_pattern("steel", "scrap", max_gap_words=1),
+    "iron scrap": flexible_phrase_pattern("iron", "scrap", max_gap_words=1),
+    "steel slag": flexible_phrase_pattern("steel", "slag", max_gap_words=1),
     "fluidized bed reduction": flexible_phrase_pattern("fluidized", "bed", "reduction", max_gap_words=1),
     "fluidized bed reactor": flexible_phrase_pattern("fluidized", "bed", "reactor", max_gap_words=1),
+    "fuel cell": flexible_phrase_pattern("fuel", "cell", max_gap_words=1),
     "molten carbonate fuel cell": flexible_phrase_pattern("molten", "carbonate", "fuel", "cell", max_gap_words=1),
     "carbonate fuel cell": flexible_phrase_pattern("carbonate", "fuel", "cell", max_gap_words=1),
+    "molten oxide": flexible_phrase_pattern("molten", "oxide", max_gap_words=1),
+    "molten oxide electrolysis": re.compile(
+        r"(?<![a-z0-9])(?:"
+        r"molten(?:\W+\w+){0,1}\W+oxide(?:\W+\w+){0,1}\W+electrolysis"
+        r"|electrolysis(?:\W+\w+){0,2}\W+molten(?:\W+\w+){0,1}\W+oxide"
+        r")(?![a-z0-9])",
+        re.IGNORECASE,
+    ),
     "co2 capture": flexible_phrase_pattern("co2", "capture", max_gap_words=2),
     "carbon storage": flexible_phrase_pattern("carbon", "storage", max_gap_words=2),
     "low carbon": flexible_phrase_pattern("low", "carbon", max_gap_words=2),
+    "renewable energy": flexible_phrase_pattern("renewable", "energy", max_gap_words=1),
     "green steel": flexible_phrase_pattern("green", "steel", max_gap_words=1),
     "hot briquetted iron": flexible_phrase_pattern("hot", "briquetted", "iron", max_gap_words=1),
     "solar thermal steelmaking": flexible_phrase_pattern("solar", "thermal", "steelmaking", max_gap_words=1),
@@ -237,10 +246,16 @@ MEDIUM_FLEXIBLE_PATTERNS = compile_flexible_patterns({
     "oxidizing gas": flexible_phrase_pattern("oxidizing", "gas", max_gap_words=1),
     "oxy fuel": re.compile(r"(?<![a-z0-9])oxy[-\s]?fuel(?![a-z0-9])", re.IGNORECASE),
     "bed reactor": flexible_phrase_pattern("bed", "reactor", max_gap_words=1),
+    "flue gas": flexible_phrase_pattern("flue", "gas", max_gap_words=1),
+    "exhaust gas": flexible_phrase_pattern("exhaust", "gas", max_gap_words=1),
+    "waste gas": flexible_phrase_pattern("waste", "gas", max_gap_words=1),
+    "off gas": flexible_phrase_pattern("off", "gas", max_gap_words=1),
     "waste heat": flexible_phrase_pattern("waste", "heat", max_gap_words=1),
     "heat recovery": flexible_phrase_pattern("heat", "recovery", max_gap_words=2),
     "red mud": flexible_phrase_pattern("red", "mud", max_gap_words=1),
     "zinc dust": flexible_phrase_pattern("zinc", "dust", max_gap_words=1),
+    "by-product": re.compile(r"(?<![a-z0-9])by[-\s]?product(?:s)?(?![a-z0-9])", re.IGNORECASE),
+    "coproduct": re.compile(r"(?<![a-z0-9])co[-\s]?product(?:s)?(?![a-z0-9])", re.IGNORECASE),
 })
 
 
@@ -261,7 +276,6 @@ def compile_term_patterns(terms):
 
 HIGH_PATTERNS = compile_term_patterns(HIGH_RELEVANCE_TERMS)
 MEDIUM_PATTERNS = compile_term_patterns(MEDIUM_RELEVANCE_TERMS)
-LOW_PATTERNS = compile_term_patterns(LOW_RELEVANCE_TERMS)
 
 
 def matched_terms(text, patterns):
@@ -286,7 +300,6 @@ rule_a_count = 0
 rule_b_count = 0
 high_counter = {}
 medium_counter = {}
-low_counter = {}
 high_flexible_counter = {}
 medium_flexible_counter = {}
 
@@ -307,8 +320,6 @@ for record in records:
     ]
     medium_hits = merge_hits(medium_exact_hits, medium_flexible_hits)
 
-    low_hits = matched_terms(text, LOW_PATTERNS)
-
     matched_rule = None
     if high_hits:
         matched_rule = "A"
@@ -328,8 +339,6 @@ for record in records:
         medium_counter[term] = medium_counter.get(term, 0) + 1
     for term in medium_flexible_hits:
         medium_flexible_counter[term] = medium_flexible_counter.get(term, 0) + 1
-    for term in low_hits:
-        low_counter[term] = low_counter.get(term, 0) + 1
 
     output_record = dict(record)
     output_record["carbon_neutral_rule"] = matched_rule
@@ -339,7 +348,6 @@ for record in records:
     output_record["medium_relevance_hits"] = medium_hits
     output_record["medium_relevance_exact_hits"] = medium_exact_hits
     output_record["medium_relevance_flexible_hits"] = medium_flexible_hits
-    output_record["low_relevance_hits"] = low_hits
     filtered.append(output_record)
 
 out.write_text(
@@ -369,4 +377,3 @@ print_top(high_counter, "高度相關詞 Top 20")
 print_top(high_flexible_counter, "高度相關詞 Flexible 額外命中 Top 20")
 print_top(medium_counter, "中度相關詞 Top 20")
 print_top(medium_flexible_counter, "中度相關詞 Flexible 額外命中 Top 20")
-print_top(low_counter, "低度相關詞 Top 20")

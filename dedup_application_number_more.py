@@ -3,30 +3,28 @@ import json
 import numpy as np
 from pathlib import Path
 
-# 輸入資料：單一 Parquet 檔
-src_path = Path("/home/carbon/carbon/data/part-000000000000.parquet")
-# 輸出去重結果：JSON 檔
-out = Path("/home/carbon/carbon/data/application_number_dedup.json")
+src_dir = Path("/home/carbon/carbon/dataa/global_allonlycpc")
+out = Path("/home/carbon/carbon/dataa/global_allonlycpc/global_allonlycpc_dedup.json")
 
-if not src_path.is_file():
-    raise FileNotFoundError(f"找不到檔案：{src_path}")
+parquet_files = sorted(src_dir.glob("*.parquet"))
+if not parquet_files:
+    raise FileNotFoundError(f"在 {src_dir} 找不到任何 .parquet 檔案")
 
-# 讀取原始資料表
-df = pd.read_parquet(src_path)
+df = pd.concat(
+    [pd.read_parquet(path) for path in parquet_files],
+    ignore_index=True,
+)
 
 # 保留原始順序，作為最後 tie-breaker
 df = df.reset_index(names="_original_order")
 
-# 將 0 視為缺失日期，排序時改放到最後，避免被誤當成最早日期
+# 將 0 視為缺失日期，避免被當成最早日期
 sort_df = df.assign(
     _priority_sort=df["priority_date"].where(df["priority_date"] != 0, 99999999),
     _filing_sort=df["filing_date"].where(df["filing_date"] != 0, 99999999),
     _publication_sort=df["publication_date"].where(df["publication_date"] != 0, 99999999),
 )
 
-# 依 application_number 去重：
-# 先按 application_number 分組，再保留 priority / filing / publication 日期最早的那筆；
-# 若日期也相同，則保留原始資料中較前面的那筆。
 dedup = (
     sort_df
     .sort_values(
@@ -52,7 +50,6 @@ dedup = (
 )
 
 def clean_json_value(value):
-    # 將 numpy / pandas 型別遞迴轉成可序列化為 JSON 的原生 Python 型別
     if isinstance(value, np.ndarray):
         return [clean_json_value(item) for item in value.tolist()]
     if isinstance(value, (list, tuple)):
@@ -64,19 +61,16 @@ def clean_json_value(value):
     return value
 
 
-# 將去重後的 DataFrame 轉成 JSON records
 records = [
     {key: clean_json_value(value) for key, value in record.items()}
     for record in dedup.to_dict(orient="records")
 ]
 
-# 寫出最終去重結果
 out.write_text(
     json.dumps(records, ensure_ascii=False, indent=2, allow_nan=False),
     encoding="utf-8",
 )
 
-# 輸出統計資訊，方便檢查去重效果
 print("source_rows", len(df))
 print("dedup_rows", len(dedup))
 print("unique_app", dedup["application_number"].nunique())

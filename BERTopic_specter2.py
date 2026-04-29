@@ -693,8 +693,8 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 # =============================================================================
 
 if __name__ == "__main__":
-
-    INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_carbon_neutral_keywords.json")
+    # INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_carbon_neutral_keywords.json")
+    INPUT_PATH    = str(PROJECT_DIR / "dataaa" / "carbon_neutral_keywords_4.json")
     TARGET_TOPICS = 20
 
     # STAGE 1：載入與前處理
@@ -729,7 +729,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("全流程執行完畢")
     print(f"最終 DataFrame 欄位：{list(df.columns)}")
-    print("輸出目錄：/home/carbon/carbon/output/")
+    print("輸出目錄：/home/carbon/carbon/output_specter2/")
     print("  ├── patent_with_topics.parquet")
     print("  ├── topic_keywords.csv")
     print("  ├── topics_over_time.csv")
