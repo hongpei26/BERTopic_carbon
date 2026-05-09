@@ -32,7 +32,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = PROJECT_DIR / "output_specter2_3000"
+OUTPUT_DIR = PROJECT_DIR / "output_specter2"
 
 
 def configure_huggingface_token() -> str | None:
@@ -211,10 +211,9 @@ def stage1_load_and_preprocess(input_path: str):
     # ── 1.7 時間區段標記（依 priority_date）──────────────────────────────
     def assign_segment(date):
         year = date.year
-        if 2006 <= year <= 2010:   return "SEG_A_2006_2010"
-        elif 2011 <= year <= 2015: return "SEG_B_2011_2015"
-        elif 2016 <= year <= 2020: return "SEG_C_2016_2020"
-        elif 2021 <= year <= 2025: return "SEG_D_2021_2025"
+        if 2006 <= year <= 2012:   return "STAGE_1_2006_2012"
+        elif 2013 <= year <= 2019: return "STAGE_2_2013_2019"
+        elif 2020 <= year <= 2025: return "STAGE_3_2020_2025"
         else:                       return "OUT_OF_RANGE"
 
     df["time_segment"] = df["priority_date"].apply(assign_segment)
@@ -551,18 +550,18 @@ def stage6_train_and_refine(
 # =============================================================================
 
 def classify_trajectory(freq, shares):
-    first, second, third, latest = freq
-    early = first + second
-    late = third + latest
+    first, second, third = freq
+    early = first
+    late = third
     growth = (late - early) / (early + 1)
     share_change = shares[-1] - shares[0]
     peak_index = int(np.argmax(freq))
 
-    if latest >= max(freq[:3]) and growth > 0.3:
+    if third >= max(freq[:2]) and growth > 0.3:
         return "新興上升"
-    if peak_index <= 1 and growth < -0.3:
+    if peak_index == 0 and growth < -0.3:
         return "早期高峰後衰退"
-    if peak_index == 2 and latest < third:
+    if peak_index == 1 and third < second:
         return "中期高峰後回落"
     if share_change > 0.03:
         return "占比提升"
@@ -582,10 +581,9 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
     print("=" * 60)
 
     SEGMENTS = [
-        "SEG_A_2006_2010",
-        "SEG_B_2011_2015",
-        "SEG_C_2016_2020",
-        "SEG_D_2021_2025"
+        "STAGE_1_2006_2012",
+        "STAGE_2_2013_2019",
+        "STAGE_3_2020_2025"
     ]
     segment_to_code = {segment: idx for idx, segment in enumerate(SEGMENTS)}
     code_to_segment = {idx: segment for segment, idx in segment_to_code.items()}
@@ -623,8 +621,8 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
         freq_map = dict(zip(subset["Timestamp"], subset["Frequency"]))
         freq     = [freq_map.get(s, 0) for s in SEGMENTS]
 
-        early  = sum(freq[:2])
-        late   = sum(freq[2:])
+        early  = freq[0]
+        late   = freq[2]
         growth = (late - early) / (early + 1)
 
         if growth > 0.5 and freq[0] < freq[-1]:
@@ -636,17 +634,16 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 
         lifecycle_rows.append({
             "Topic_ID"   : tid,
-            "Freq_SEG_A" : freq[0],
-            "Freq_SEG_B" : freq[1],
-            "Freq_SEG_C" : freq[2],
-            "Freq_SEG_D" : freq[3],
+            "Freq_STAGE_1" : freq[0],
+            "Freq_STAGE_2" : freq[1],
+            "Freq_STAGE_3" : freq[2],
             "Growth_Rate": round(growth, 3),
             "Status"     : status
         })
 
         print(
             f"Topic {tid:>3} | "
-            f"A:{freq[0]:>4}  B:{freq[1]:>4}  C:{freq[2]:>4}  D:{freq[3]:>4} | "
+            f"S1:{freq[0]:>4}  S2:{freq[1]:>4}  S3:{freq[2]:>4} | "
             f"成長率:{growth:>+6.2f} | {status}"
         )
 
@@ -684,7 +681,7 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
     count_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Doc_Count"]))
 
     evolution_rows = []
-    segment_midpoints = np.array([2008, 2013, 2018, 2023], dtype=float)
+    segment_midpoints = np.array([2009, 2016, 2022], dtype=float)
 
     for topic_id in sorted(segment_counts.index):
         freq = [int(segment_counts.loc[topic_id, segment]) for segment in SEGMENTS]
@@ -698,14 +695,12 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
             "Topic_Label": f"Topic_{topic_id}",
             "Top10_Keywords": keywords,
             "Doc_Count": int(count_map.get(topic_id, sum(freq))),
-            "Freq_2006_2010": freq[0],
-            "Freq_2011_2015": freq[1],
-            "Freq_2016_2020": freq[2],
-            "Freq_2021_2025": freq[3],
-            "Share_2006_2010": round(shares[0], 4),
-            "Share_2011_2015": round(shares[1], 4),
-            "Share_2016_2020": round(shares[2], 4),
-            "Share_2021_2025": round(shares[3], 4),
+            "Freq_2006_2012": freq[0],
+            "Freq_2013_2019": freq[1],
+            "Freq_2020_2025": freq[2],
+            "Share_2006_2012": round(shares[0], 4),
+            "Share_2013_2019": round(shares[1], 4),
+            "Share_2020_2025": round(shares[2], 4),
             "Share_Change_2006_to_2025": round(shares[-1] - shares[0], 4),
             "Share_Slope_Per_Year": round(slope, 6),
             "Peak_Segment": SEGMENTS[peak_idx],
@@ -736,8 +731,9 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 
 if __name__ == "__main__":
     # INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_carbon_neutral_keywords.json")
-    INPUT_PATH    = str(PROJECT_DIR / "data_global" / "global_carbon_neutral_keywords2.json")
-    TARGET_TOPICS = 10
+    INPUT_PATH    = str(PROJECT_DIR / "dataa" /"global_allonlycpc"/ "global_allonlycpc_carbon_neutral_keywords.json")
+    TARGET_TOPICS = 30
+
 
     # STAGE 1：載入與前處理
     df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)

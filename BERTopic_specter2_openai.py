@@ -32,7 +32,20 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = PROJECT_DIR / "output_specter2_3000"
+
+if load_dotenv is not None:
+    load_dotenv(PROJECT_DIR / ".env")
+
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "specter2").strip().lower()
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip()
+OUTPUT_DIR = PROJECT_DIR / os.getenv(
+    "OUTPUT_DIR",
+    (
+        f"output_openai_{OPENAI_EMBEDDING_MODEL.replace('-', '_')}"
+        if EMBEDDING_PROVIDER == "openai"
+        else "output_specter2"
+    ),
+)
 
 
 def configure_huggingface_token() -> str | None:
@@ -300,14 +313,70 @@ class Specter2Embedder:
         return np.vstack(embeddings)
 
 
-def stage2_embed(embedding_texts: list, batch_size: int = 32):
+class OpenAIEmbedder:
     """
-    使用 SPECTER2 將 title + abstract 轉化為 768 維語義向量。
+    使用 OpenAI embeddings API 產生 title + abstract 向量。
+    OPENAI_API_KEY 由 .env 或環境變數提供。
     """
 
+    def __init__(self, model: str = "text-embedding-3-small"):
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "使用 OpenAI embeddings 需要先安裝 openai："
+                "/home/carbon/carbon/.venv/bin/python -m pip install openai"
+            ) from exc
+
+        if not os.getenv("OPENAI_API_KEY"):
+            raise EnvironmentError("找不到 OPENAI_API_KEY，請在 .env 或環境變數中設定。")
+
+        self.model = model
+        self.client = OpenAI()
+
+    def encode(self, texts: list[str], batch_size: int = 128) -> np.ndarray:
+        embeddings = []
+        total = len(texts)
+
+        for start in range(0, total, batch_size):
+            batch = texts[start:start + batch_size]
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=batch,
+                encoding_format="float",
+            )
+            batch_embeddings = [item.embedding for item in response.data]
+            embeddings.extend(batch_embeddings)
+            print(f"  embedded {min(start + batch_size, total):,}/{total:,}")
+
+        return np.asarray(embeddings, dtype=np.float32)
+
+
+def stage2_embed(embedding_texts: list, batch_size: int = 32):
+    """
+    將 title + abstract 轉化為語義向量。
+    EMBEDDING_PROVIDER=specter2 使用本機 SPECTER2；
+    EMBEDDING_PROVIDER=openai 使用 OpenAI text embeddings。
+    """
+
+    provider = EMBEDDING_PROVIDER
     print("=" * 60)
-    print("STAGE 2：SPECTER2 語義嵌入")
+    print(f"STAGE 2：語義嵌入（provider={provider}）")
     print("=" * 60)
+
+    if provider == "openai":
+        embedding_model = OpenAIEmbedder(model=OPENAI_EMBEDDING_MODEL)
+        print(
+            f"開始嵌入 {len(embedding_texts):,} 筆 title + abstract"
+            f"（model={OPENAI_EMBEDDING_MODEL}, batch_size={batch_size}）..."
+        )
+        embeddings = embedding_model.encode(embedding_texts, batch_size=batch_size)
+        print(f"\nSTAGE 2 完成，嵌入矩陣維度：{embeddings.shape}")
+        print(f"（{embeddings.shape[0]:,} 筆 × {embeddings.shape[1]} 維）\n")
+        return embedding_model, embeddings
+
+    if provider != "specter2":
+        raise ValueError("EMBEDDING_PROVIDER 只支援 'specter2' 或 'openai'")
 
     base_model_name = "allenai/specter2_base"
     adapter_name = "allenai/specter2"
@@ -736,14 +805,19 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 
 if __name__ == "__main__":
     # INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_carbon_neutral_keywords.json")
-    INPUT_PATH    = str(PROJECT_DIR / "data_global" / "global_carbon_neutral_keywords2.json")
-    TARGET_TOPICS = 10
+    INPUT_PATH    = str(PROJECT_DIR / "dataa" /"global_allonlycpc"/ "global_allonlycpc_carbon_neutral_keywords.json")
+    TARGET_TOPICS = 30
+
 
     # STAGE 1：載入與前處理
     df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)
 
-    # STAGE 2：SPECTER2 嵌入
-    embedding_model, embeddings = stage2_embed(embedding_texts, batch_size=32)
+    # STAGE 2：語義嵌入
+    embedding_batch_size = 128 if EMBEDDING_PROVIDER == "openai" else 32
+    embedding_model, embeddings = stage2_embed(
+        embedding_texts,
+        batch_size=embedding_batch_size,
+    )
 
     # STAGE 3：UMAP 降維設定
     umap_model = stage3_umap()
@@ -771,7 +845,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("全流程執行完畢")
     print(f"最終 DataFrame 欄位：{list(df.columns)}")
-    print("輸出目錄：/home/carbon/carbon/output_specter2/")
+    print(f"輸出目錄：{OUTPUT_DIR}/")
     print("  ├── patent_with_topics.parquet")
     print("  ├── topic_keywords.csv")
     print("  ├── topics_over_time.csv")
