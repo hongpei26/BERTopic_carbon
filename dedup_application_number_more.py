@@ -14,8 +14,8 @@ from pathlib import Path
 # 5. 最後輸出為 JSON，並把 numpy / pandas 的特殊值轉成 JSON 可序列化格式。
 # =============================================================================
 
-src_dir = Path("/home/carbon/carbon/data_global")
-out = Path("/home/carbon/carbon/data_global/global_application_dedup.json")
+src_dir = Path("/home/carbon/carbon/data_globalmorecpc")
+out = Path("/home/carbon/carbon/data_globalmorecpc/global_application_dedup.json")
 
 # 收集來源資料夾中的所有 Parquet 檔，排序後讀取可讓結果更穩定可重現。
 parquet_files = sorted(src_dir.glob("*.parquet"))

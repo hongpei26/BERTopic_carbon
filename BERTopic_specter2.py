@@ -736,9 +736,8 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 
 if __name__ == "__main__":
     # INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_carbon_neutral_keywords.json")
-    INPUT_PATH    = str(PROJECT_DIR / "data_global" / "global_carbon_neutral_keywords2.json")
-    TARGET_TOPICS = 10
-
+    INPUT_PATH    = str(PROJECT_DIR / "data_globalmorecpc" / "global_onlycpc_carbon_neutral_v2.json")
+    TARGET_TOPICS = 50
     # STAGE 1：載入與前處理
     df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)
 

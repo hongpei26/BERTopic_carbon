@@ -3,25 +3,22 @@ import re
 from pathlib import Path
 
 # =============================================================================
-# 依 CPC 代碼與摘要語境詞篩選「鋼鐵領域」且「碳中和/減碳目標」相關的專利
+# 依 CPC 代碼篩選「鋼鐵領域」且「碳中和/減碳目標」相關的專利
 #
 # 篩選順序(嚴格依此順序執行):
 #   步驟一、時間過濾:priority_date 年份 ∈ [2006, 2025]
 #           - 空值、None、0、"0"、"00000000" 等一律跳過
 #           - 必須最先執行,後續所有計算都以時間過濾後的母體為準
-#   步驟二、CPC + 關鍵字篩選:
+#   步驟二、CPC 篩選:
 #           減碳目標 CPC
 #           AND
-#           (
-#             C21B/C21C  (鋼鐵領域 CPC)
-#             OR 至少 1 個強鋼鐵語境詞
-#           )
+#           C21B/C21C  (鋼鐵領域 CPC)
 # =============================================================================
 
 # 輸入資料:前一步依 abstract_en 去重後的資料。
 src = Path("/home/carbon/carbon/data_globalmorecpc/global_abstract_dedup.json")
-# 輸出資料:同時命中減碳目標 CPC 與鋼鐵場域條件的資料。
-out = Path("/home/carbon/carbon/data_globalmorecpc/global_cpc_domain_target_intersection.json")
+# 輸出資料:同時命中減碳目標 CPC 與鋼鐵領域 CPC 的資料。
+out = Path("/home/carbon/carbon/data_globalmorecpc/global_onlycpc_domain_target_intersection.json")
 
 
 # =============================================================================
@@ -36,163 +33,6 @@ DOMAIN_PREFIXES = [
     "C21B",  # 高爐與鐵製造
     "C21C",  # 煉鋼精煉
 ]
-
-# 鋼鐵業「強」語境詞:命中 1 個即可作為鋼鐵場域證據。
-STEEL_CONTEXT_STRONG_TERMS = [
-    "steelmaking",
-    "ironmaking",
-    "blast furnace",
-    "basic oxygen furnace",
-    "oxygen converter",
-    "electric arc furnace",
-    "ladle furnace",
-    "shaft furnace",
-    "direct reduction",
-    "direct reduced iron",
-    "DRI",
-    "hot briquetted iron",
-    "HBI",
-    "molten iron",
-    "molten steel",
-    "pig iron",
-    "crude steel",
-    "liquid steel",
-    "liquid iron",
-    "steel scrap",
-    "steel slag",
-    "blast furnace slag",
-    "converter slag",
-    "steelmaking dust",
-    "blast furnace dust",
-    "blast furnace gas",
-    "blast furnace top gas",
-    "converter gas",
-    "coke oven gas",
-]
-
-# 鋼鐵業「中度」語境詞:僅供統計觀察與人工檢查,不作為通過條件。
-STEEL_CONTEXT_MEDIUM_TERMS = [
-    "steel",
-    "iron",
-    "ferrous",
-    "ferrous metal",
-    "metallurgical",
-    "metallurgy",
-    "hot metal",
-    "converter",
-    "refining furnace",
-    "rotary hearth furnace",
-    "smelting furnace",
-    "sintering",
-    "pelletizing",
-    "coking",
-    "coke oven",
-    "continuous casting",
-    "rolling mill",
-    "annealing furnace",
-    "reheating furnace",
-    "iron ore",
-    "iron oxide",
-    "ore fines",
-    "pellet",
-    "sinter",
-    "mill scale",
-    "ferrous waste",
-    "metallurgical waste",
-]
-
-STEEL_CONTEXT_MEDIUM_THRESHOLD = 2
-
-# 字尾變形白名單:只放寬到常見英文屈折變化。
-WORD_SUFFIX_PATTERN = r"(?:s|es|ed|ing)?"
-
-FILLER_WORDS = [
-    "a",
-    "an",
-    "and",
-    "based",
-    "containing",
-    "for",
-    "from",
-    "in",
-    "of",
-    "or",
-    "the",
-    "to",
-    "using",
-    "with",
-]
-
-
-def term_token_pattern(token, allow_suffix=False):
-    """建立單一關鍵詞 token 的彈性 regex 片段。"""
-    escaped = re.escape(token.lower())
-    base = escaped.replace(r"\-", r"[-\s]").replace(r"\/", r"[/\s-]")
-    if allow_suffix:
-        return base + WORD_SUFFIX_PATTERN
-    return base
-
-
-def flexible_phrase_pattern(*tokens, max_gap_words=2, allow_suffix=True):
-    """建立可容忍填充詞或少量插入詞的片語 regex。"""
-    gap = rf"(?:\W+(?:{'|'.join(FILLER_WORDS)}))*"
-    parts = [term_token_pattern(token, allow_suffix=allow_suffix) for token in tokens]
-
-    if max_gap_words > 0:
-        loose_gap = rf"(?:\W+\w+){{0,{max_gap_words}}}\W+"
-        joiner = rf"(?:{gap}|{loose_gap})"
-    else:
-        joiner = rf"(?:{gap}|\W+)"
-
-    return re.compile(
-        rf"(?<![a-z0-9]){parts[0]}"
-        + "".join(rf"{joiner}{part}" for part in parts[1:])
-        + r"(?![a-z0-9])",
-        re.IGNORECASE,
-    )
-
-
-def compile_steel_context_patterns(terms, max_gap_words=2, allow_suffix=True):
-    """將鋼鐵業語境詞編譯成大小寫不敏感且具彈性的 regex。"""
-    patterns = []
-
-    for term in terms:
-        if term.isupper():
-            pattern = re.compile(
-                rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])",
-                re.IGNORECASE,
-            )
-        else:
-            tokens = term.split()
-            if len(tokens) == 1:
-                pattern = re.compile(
-                    rf"(?<![a-z0-9]){term_token_pattern(tokens[0], allow_suffix=allow_suffix)}(?![a-z0-9])",
-                    re.IGNORECASE,
-                )
-            else:
-                pattern = flexible_phrase_pattern(
-                    *tokens,
-                    max_gap_words=max_gap_words,
-                    allow_suffix=allow_suffix,
-                )
-
-        patterns.append((term, pattern))
-
-    return patterns
-
-
-STEEL_CONTEXT_STRONG_PATTERNS = compile_steel_context_patterns(
-    STEEL_CONTEXT_STRONG_TERMS,
-    max_gap_words=3,
-    allow_suffix=True,
-)
-
-STEEL_CONTEXT_MEDIUM_PATTERNS = compile_steel_context_patterns(
-    STEEL_CONTEXT_MEDIUM_TERMS,
-    max_gap_words=1,
-    allow_suffix=True,
-)
-
 
 # 第二群組:碳中和、製程減碳、CO2 捕集/處理、氣體分離相關 CPC 前綴。
 TARGET_PREFIXES = [
@@ -345,26 +185,6 @@ def get_cpc_codes(record):
     return []
 
 
-def _record_text(record):
-    """串接 title_en + abstract_en 作為比對來源文本。"""
-    return " ".join(
-        str(record.get(field) or "")
-        for field in ("title_en", "abstract_en")
-    )
-
-
-def matched_steel_context_terms(record, patterns):
-    """回傳 title/abstract 中命中的鋼鐵業語境詞清單。"""
-    text = _record_text(record)
-
-    hits = []
-    for term, pattern in patterns:
-        if pattern.search(text):
-            hits.append(term)
-
-    return hits
-
-
 # =============================================================================
 # 主流程
 # =============================================================================
@@ -377,7 +197,7 @@ total_input = len(records)
 # -----------------------------------------------------------------------------
 # 步驟一:時間過濾(必須最先執行)
 #   priority_date 年份 ∈ [PRIORITY_YEAR_MIN, PRIORITY_YEAR_MAX]
-#   空值、0、無法解析者一律跳過,不會進入後續 CPC / 關鍵字篩選。
+#   空值、0、無法解析者一律跳過,不會進入後續 CPC 篩選。
 # -----------------------------------------------------------------------------
 records_in_range = []
 year_missing = 0       # priority_date 缺失/空值/0/無法解析
@@ -401,63 +221,39 @@ for record in records:
 
 
 # -----------------------------------------------------------------------------
-# 步驟二:CPC + 關鍵字篩選(只跑時間範圍內的資料)
+# 步驟二:CPC 篩選(只跑時間範圍內的資料)
 # -----------------------------------------------------------------------------
 filtered = []
 
 # 各條件命中筆數(以時間過濾後的母體計算)。
 domain_hit_count = 0
 target_hit_count = 0
-strong_context_hit_count = 0
-medium_context_threshold_count = 0
-steel_domain_any_count = 0
-
-# 互斥分類:加總應等於 steel_domain_any_count。
-exclusive_domain = 0
-exclusive_strong = 0
+steel_domain_cpc_count = 0
 
 for record in records_in_range:
     cpc_codes = get_cpc_codes(record)
 
     domain_hits = matched_prefixes(cpc_codes, DOMAIN_PREFIXES)
     target_hits = matched_prefixes(cpc_codes, TARGET_PREFIXES)
-    strong_hits = matched_steel_context_terms(record, STEEL_CONTEXT_STRONG_PATTERNS)
-    medium_hits = matched_steel_context_terms(record, STEEL_CONTEXT_MEDIUM_PATTERNS)
-
-    medium_pass = len(medium_hits) >= STEEL_CONTEXT_MEDIUM_THRESHOLD
 
     if domain_hits:
         domain_hit_count += 1
     if target_hits:
         target_hit_count += 1
-    if strong_hits:
-        strong_context_hit_count += 1
-    if medium_pass:
-        medium_context_threshold_count += 1
 
-    is_steel_domain = bool(domain_hits) or bool(strong_hits)
+    is_steel_domain = bool(domain_hits)
 
     if is_steel_domain:
-        steel_domain_any_count += 1
+        steel_domain_cpc_count += 1
 
-        if domain_hits:
-            exclusive_domain += 1
-        else:
-            exclusive_strong += 1
-
-    # 篩選條件:減碳目標 CPC AND (鋼鐵領域 CPC OR 強詞≥1)。
+    # 篩選條件:減碳目標 CPC AND 鋼鐵領域 CPC。
     if is_steel_domain and target_hits:
         output_record = dict(record)
         output_record["priority_year"] = extract_priority_year(record)
         output_record["domain_matched_prefixes"] = domain_hits
         output_record["target_matched_prefixes"] = target_hits
-        output_record["steel_context_strong_terms"] = strong_hits
-        output_record["steel_context_medium_terms"] = medium_hits
 
-        if domain_hits:
-            output_record["domain_source"] = "cpc_domain"
-        else:
-            output_record["domain_source"] = "steel_text_context_strong"
+        output_record["domain_source"] = "cpc_domain"
 
         filtered.append(output_record)
 
@@ -492,16 +288,12 @@ print()
 print("[步驟二] 各條件命中筆數(以時間過濾後母體計算,彼此可能重複)")
 print(f"  命中鋼鐵領域 CPC (C21B/C21C):{domain_hit_count:,}")
 print(f"  命中減碳目標 CPC:{target_hit_count:,}")
-print(f"  命中強鋼鐵語境詞 ≥ 1:{strong_context_hit_count:,}")
-print(f"  命中中度鋼鐵語境詞 ≥ {STEEL_CONTEXT_MEDIUM_THRESHOLD}(僅供觀察):{medium_context_threshold_count:,}")
 print()
-print("[鋼鐵場域聯集(去重)]")
-print(f"  任一鋼鐵場域證據:{steel_domain_any_count:,}")
-print(f"    其中靠鋼鐵領域 CPC:{exclusive_domain:,}")
-print(f"    其中靠強詞(無鋼鐵領域 CPC):{exclusive_strong:,}")
+print("[鋼鐵場域條件]")
+print(f"  鋼鐵領域 CPC:{steel_domain_cpc_count:,}")
 print()
 print("[最終輸出]")
-print(f"  減碳目標 CPC AND (鋼鐵領域 CPC OR 強鋼鐵語境詞) AND 年份範圍:{len(filtered):,}")
+print(f"  減碳目標 CPC AND 鋼鐵領域 CPC AND 年份範圍:{len(filtered):,}")
 if year_distribution:
     print(f"  年份分布:")
     for year in sorted(year_distribution):

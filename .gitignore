@@ -15,3 +15,5 @@ scratch*.py
 output_*/
 data_global/
 scratch*.py
+data_globalmorecpc/
+*.txt

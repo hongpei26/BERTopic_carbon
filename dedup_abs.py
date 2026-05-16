@@ -19,9 +19,9 @@ from pathlib import Path
 # =============================================================================
 
 # 輸入資料：前一步 application_number 去重後的 JSON
-src = Path("/home/carbon/carbon/data_global/global_application_dedup.json")
+src = Path("/home/carbon/carbon/data_globalmorecpc/global_application_dedup.json")
 # 輸出資料：再依摘要去重後的 JSON
-out = Path("/home/carbon/carbon/data_global/global_abstract_dedup.json")
+out = Path("/home/carbon/carbon/data_globalmorecpc/global_abstract_dedup.json")
 
 
 def date_sort_value(value):
