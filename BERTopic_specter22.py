@@ -32,7 +32,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = PROJECT_DIR / "output_specter2"
+OUTPUT_DIR = PROJECT_DIR / "output_specter2_3000"
 
 
 def configure_huggingface_token() -> str | None:
@@ -102,6 +102,7 @@ CORPUS_STOPWORDS = {
     "partially", "uninterruptedly", "directly", "indirectly", "deals",
     "substance", "substances", "matter", "average", "layer", "visual",
     "information", "body", "export", "batch", "ls", "al", "vtd", "pgm", "pcd",
+    "wt", "weight", "mass", "temperature", "degree", "celsius", "pressure", "mm", "vol", "lb", "btu",
 }
 
 CUSTOM_STOPWORDS = sorted(
@@ -174,7 +175,7 @@ def stage1_load_and_preprocess(input_path: str):
         清洗單筆 Abstract：
         1. HTML entity 解碼並移除 tag
         2. 轉小寫
-        3. 移除數字與特殊符號（保留字母與空白）
+        3. 移除非字母、數字字元（保留字母、數字與空白，保護化學式）
         4. 移除多餘空白與 HTML 殘留 token
         5. 移除專利法律套語停用詞
         """
@@ -184,8 +185,8 @@ def stage1_load_and_preprocess(input_path: str):
         text = text.lower()
         # 常見 html/xml 殘留字串先清掉，避免產生 lt / gt / sub 之類雜訊 token
         text = re.sub(r"&[a-z]+;", " ", text)
-        # 移除非字母字元（保留空白）
-        text = re.sub(r"[^a-z\s]", " ", text)
+        # 移除非字母、數字字元（保留字母、數字與空白，保護化學式）
+        text = re.sub(r"[^a-z0-9\s]", " ", text)
         # 移除多餘空白
         text = re.sub(r"\s+", " ", text).strip()
         # 移除停用詞（完整單字比對）
@@ -211,9 +212,10 @@ def stage1_load_and_preprocess(input_path: str):
     # ── 1.7 時間區段標記（依 priority_date）──────────────────────────────
     def assign_segment(date):
         year = date.year
-        if 2006 <= year <= 2012:   return "STAGE_1_2006_2012"
-        elif 2013 <= year <= 2019: return "STAGE_2_2013_2019"
-        elif 2020 <= year <= 2025: return "STAGE_3_2020_2025"
+        if 2006 <= year <= 2010:   return "SEG_A_2006_2010"
+        elif 2011 <= year <= 2015: return "SEG_B_2011_2015"
+        elif 2016 <= year <= 2020: return "SEG_C_2016_2020"
+        elif 2021 <= year <= 2025: return "SEG_D_2021_2025"
         else:                       return "OUT_OF_RANGE"
 
     df["time_segment"] = df["priority_date"].apply(assign_segment)
@@ -399,6 +401,7 @@ def stage5_vectorizer():
     vectorizer_model = CountVectorizer(
         ngram_range=(1, 3),
         stop_words=CUSTOM_STOPWORDS,
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_]+\b",
         min_df=1,
         max_df=1.0
     )
@@ -478,6 +481,16 @@ def stage6_train_and_refine(
             strategy="embeddings",
         )
         topic_model.topics_ = reassigned_topics
+        
+        # ⚠️ 非常重要：必須呼叫 update_topics 來更新內部的 TF-IDF 關鍵字與主題大小
+        # ⚠️ 修正：必須同時傳入 vectorizer_model 與 ctfidf_model，否則 BERTopic 會自動還原成預設值（導致變成單字且失去停用詞設定）
+        topic_model.update_topics(
+            abstracts, 
+            topics=reassigned_topics, 
+            vectorizer_model=vectorizer_model, 
+            ctfidf_model=ctfidf_model
+        )
+
         df = df.copy()
         df["topic_id"] = reassigned_topics
         print(
@@ -550,18 +563,18 @@ def stage6_train_and_refine(
 # =============================================================================
 
 def classify_trajectory(freq, shares):
-    first, second, third = freq
-    early = first
-    late = third
+    first, second, third, latest = freq
+    early = first + second
+    late = third + latest
     growth = (late - early) / (early + 1)
     share_change = shares[-1] - shares[0]
     peak_index = int(np.argmax(freq))
 
-    if third >= max(freq[:2]) and growth > 0.3:
+    if latest >= max(freq[:3]) and growth > 0.3:
         return "新興上升"
-    if peak_index == 0 and growth < -0.3:
+    if peak_index <= 1 and growth < -0.3:
         return "早期高峰後衰退"
-    if peak_index == 1 and third < second:
+    if peak_index == 2 and latest < third:
         return "中期高峰後回落"
     if share_change > 0.03:
         return "占比提升"
@@ -581,9 +594,10 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
     print("=" * 60)
 
     SEGMENTS = [
-        "STAGE_1_2006_2012",
-        "STAGE_2_2013_2019",
-        "STAGE_3_2020_2025"
+        "SEG_A_2006_2010",
+        "SEG_B_2011_2015",
+        "SEG_C_2016_2020",
+        "SEG_D_2021_2025"
     ]
     segment_to_code = {segment: idx for idx, segment in enumerate(SEGMENTS)}
     code_to_segment = {idx: segment for segment, idx in segment_to_code.items()}
@@ -621,8 +635,8 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
         freq_map = dict(zip(subset["Timestamp"], subset["Frequency"]))
         freq     = [freq_map.get(s, 0) for s in SEGMENTS]
 
-        early  = freq[0]
-        late   = freq[2]
+        early  = sum(freq[:2])
+        late   = sum(freq[2:])
         growth = (late - early) / (early + 1)
 
         if growth > 0.5 and freq[0] < freq[-1]:
@@ -634,16 +648,17 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 
         lifecycle_rows.append({
             "Topic_ID"   : tid,
-            "Freq_STAGE_1" : freq[0],
-            "Freq_STAGE_2" : freq[1],
-            "Freq_STAGE_3" : freq[2],
+            "Freq_SEG_A" : freq[0],
+            "Freq_SEG_B" : freq[1],
+            "Freq_SEG_C" : freq[2],
+            "Freq_SEG_D" : freq[3],
             "Growth_Rate": round(growth, 3),
             "Status"     : status
         })
 
         print(
             f"Topic {tid:>3} | "
-            f"S1:{freq[0]:>4}  S2:{freq[1]:>4}  S3:{freq[2]:>4} | "
+            f"A:{freq[0]:>4}  B:{freq[1]:>4}  C:{freq[2]:>4}  D:{freq[3]:>4} | "
             f"成長率:{growth:>+6.2f} | {status}"
         )
 
@@ -681,7 +696,7 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
     count_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Doc_Count"]))
 
     evolution_rows = []
-    segment_midpoints = np.array([2009, 2016, 2022], dtype=float)
+    segment_midpoints = np.array([2008, 2013, 2018, 2023], dtype=float)
 
     for topic_id in sorted(segment_counts.index):
         freq = [int(segment_counts.loc[topic_id, segment]) for segment in SEGMENTS]
@@ -695,12 +710,14 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
             "Topic_Label": f"Topic_{topic_id}",
             "Top10_Keywords": keywords,
             "Doc_Count": int(count_map.get(topic_id, sum(freq))),
-            "Freq_2006_2012": freq[0],
-            "Freq_2013_2019": freq[1],
-            "Freq_2020_2025": freq[2],
-            "Share_2006_2012": round(shares[0], 4),
-            "Share_2013_2019": round(shares[1], 4),
-            "Share_2020_2025": round(shares[2], 4),
+            "Freq_2006_2010": freq[0],
+            "Freq_2011_2015": freq[1],
+            "Freq_2016_2020": freq[2],
+            "Freq_2021_2025": freq[3],
+            "Share_2006_2010": round(shares[0], 4),
+            "Share_2011_2015": round(shares[1], 4),
+            "Share_2016_2020": round(shares[2], 4),
+            "Share_2021_2025": round(shares[3], 4),
             "Share_Change_2006_to_2025": round(shares[-1] - shares[0], 4),
             "Share_Slope_Per_Year": round(slope, 6),
             "Peak_Segment": SEGMENTS[peak_idx],
@@ -730,11 +747,8 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 # =============================================================================
 
 if __name__ == "__main__":
-    # INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_carbon_neutral_keywords.json")
-    INPUT_PATH    = str(PROJECT_DIR / "dataa" /"global_allonlycpc"/ "global_allonlycpc_carbon_neutral_keywords.json")
-    TARGET_TOPICS = 30
-
-
+    INPUT_PATH    = str(PROJECT_DIR / "data_globalmorecpc" / "global_onlycpc_carbon_neutral_v2.json")
+    TARGET_TOPICS = 50
     # STAGE 1：載入與前處理
     df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)
 
@@ -756,7 +770,8 @@ if __name__ == "__main__":
         embedding_model, embeddings,
         umap_model, hdbscan_model,
         vectorizer_model, ctfidf_model,
-        target_topics=TARGET_TOPICS
+        target_topics=TARGET_TOPICS,
+        apply_outlier_reduction=False
     )
 
     # STAGE 7：Topics over Time 動態分析

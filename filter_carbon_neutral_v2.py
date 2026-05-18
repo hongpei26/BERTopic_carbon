@@ -30,33 +30,30 @@ def action_phrase_pattern(object_pattern, action_pattern):
     )
 
 
-# 1. 負向排除關鍵字 (Negative Filters)
-# 排除指的是「產品」而非「製程」的詞彙
+# 1. 負向排除關鍵字 (Negative Filters) - 僅精準排除下游產品材料，不誤傷製程回收
 EXCLUSION_TERMS = [
     r"low[-\s]carbon steel",
     r"low[-\s]carbon equivalent",
-    r"stainless steel",
     r"bearing steel",
     r"marine steel",
     r"high[-\s]strength steel",
     r"spring steel",
     r"gear steel",
     r"free[-\s]cutting steel",
+    r"stainless steel (?:sheet|plate|material|composition|wire|bar|product)",
+    r"duplex stainless steel material",
+    r"austenitic stainless steel material",
+    r"ferritic stainless steel material",
 ]
 
-# 2. 高度相關關鍵字 (High Relevance) - 命中一個即保留
+# 2. 高度相關關鍵字 (High Relevance) - 命中即保留 (僅保留「純原生綠色低碳技術」)
 HIGH_RELEVANCE_TERMS = [
-    r"direct reduction", 
-    r"direct reduced iron", 
-    r"dri\b", 
-    r"sponge iron",
-    r"shaft furnace", 
     r"hydrogen metallurgy", 
     r"hydrogen[-\s]based", 
     r"hydrogen reduction",
-    r"electric arc furnace", 
-    r"arc furnace", 
-    r"\beaf\b",
+    r"hydrogen[-\s]injection",
+    r"co2[-\s]injection",
+    r"molten oxide electrolysis",
     r"carbon capture", 
     r"co2 capture", 
     r"ccus\b", 
@@ -77,28 +74,47 @@ HIGH_RELEVANCE_TERMS = [
     r"full scrap", 
     r"100% scrap", 
     r"solar thermal steelmaking",
-    r"melting reduction",
     ("top gas recycling", action_phrase_pattern(phrase_pattern("top", "gas"), RECYCLE_FORMS)),
     r"\btgr\b"
 ]
 
 # 3. 中度相關關鍵字 (Medium Relevance) - 需搭配 ACTION_TERMS
+# (已將傳統核心設備與副產物詞彙完整收錄於此，降級實施動態交叉驗證)
 MEDIUM_RELEVANCE_TERMS = [
     r"blast furnace", 
     r"converter", 
     r"smelting furnace", 
     r"electric furnace",
-    r"molten slag", 
-    r"converter slag",
-    r"steelmaking dust", 
-    r"furnace dust", 
-    r"flue gas", 
-    r"waste gas", 
-    r"exhaust gas",
-    r"off gas", 
-    r"waste heat", 
-    r"coke oven gas", 
-    r"furnace gas", 
+    r"electric arc furnace",
+    r"arc furnace",
+    r"\beaf\b",
+    r"shaft furnace",
+    r"direct reduction",
+    r"direct reduced iron",
+    r"\bdri\b",
+    r"sponge iron",
+    r"melting reduction",
+    r"steel[-\s]slag",
+    r"steelmaking[-\s]slag",
+    r"converter[-\s]slag",
+    r"blast[-\s]furnace[-\s]slag",
+    r"molten slag",
+    r"\bslag(?:s)?\b",
+    r"steelmaking[-\s]dust",
+    r"converter[-\s]dust",
+    r"blast[-\s]furnace[-\s]dust",
+    r"iron[-\s]and[-\s]steel[-\s]dust",
+    r"\bdust(?:s)?\b",
+    r"blast[-\s]furnace[-\s]gas",
+    r"top[-\s]gas",
+    r"coke[-\s]oven[-\s]gas",
+    r"furnace[-\s]gas",
+    r"flue[-\s]gas",
+    r"waste[-\s]gas",
+    r"exhaust[-\s]gas",
+    r"off[-\s]gas",
+    r"\bgas(?:es)?\b",
+    r"waste heat",
     r"scrap\b", 
     r"steel scrap"
 ]
@@ -111,10 +127,12 @@ ACTION_TERMS = [
     r"reuse", 
     r"utilization",
     r"efficiency", 
-    r"reduce emissions?", 
+    r"reduce (?:emissions?|co2|carbon dioxide|coke rate|carbon consumption|energy consumption)",
     r"reducing emissions?",
-    r"reduce co2\b",
-    r"reduce carbon dioxide",
+    r"suppress (?:co2|carbon dioxide|emissions?)",
+    r"carbonat\w*",
+    r"methanat\w*",
+    r"sequest\w*",
     r"energy saving", 
     r"optimization",
     r"preheat\w*",
@@ -192,12 +210,12 @@ for record in records:
         stats["noise_excluded"] += 1
         exclusion_counter.update(exclude_hits)
     elif high_hits:
-        # 命中高相關詞，直接保留
+        # 命中高相關詞（原生低碳路徑或已組裝好雙向特徵的短語），直接保留
         matched_rule = "Rule_A"
         stats["rule_a_high"] += 1
         high_counter.update(high_hits)
     elif medium_hits and action_hits:
-        # 命中中度相關詞，且同時有回收/優化/減排等動作詞
+        # 命中中度相關詞（設備名、廣義渣/氣），且同時有回收/優化/減排等動作詞
         matched_rule = "Rule_B"
         stats["rule_b_medium_action"] += 1
         medium_counter.update(medium_hits)
@@ -209,10 +227,11 @@ for record in records:
     if matched_rule in ["Rule_A", "Rule_B"]:
         output_record = dict(record)
         output_record["carbon_neutral_rule"] = matched_rule
-        output_record["high_relevance_hits"] = high_hits
-        output_record["medium_relevance_hits"] = medium_hits
-        output_record["action_hits"] = action_hits
-        output_record["exclude_hits"] = exclude_hits
+        # 對標籤進行 list(set()) 去重，維持 Metadata 的乾淨度
+        output_record["high_relevance_hits"] = list(set(high_hits))
+        output_record["medium_relevance_hits"] = list(set(medium_hits))
+        output_record["action_hits"] = list(set(action_hits))
+        output_record["exclude_hits"] = list(set(exclude_hits))
         filtered_records.append(output_record)
 
 print("寫入輸出檔案...")
@@ -223,12 +242,12 @@ out.write_text(
 )
 
 # 列印統計結果
-print("\n=== 鋼鐵業碳中和關鍵字篩選 V2 結果 ===")
+print("\n=== 鋼鐵業碳中和關鍵字篩選 V2 最終精確版結果 ===")
 print(f"輸入總筆數：{stats['total']:,}")
 print(f"因命中排除詞(如材料配方)而剔除的雜訊筆數：{stats['noise_excluded']:,}")
 print(f"因未命中任何規則而未納入的筆數：{stats['unmatched']:,}")
-print(f"規則 A (高度相關技術) 納入：{stats['rule_a_high']:,}")
-print(f"規則 B (設備/副產物 + 循環/優化動作) 納入：{stats['rule_b_medium_action']:,}")
+print(f"規則 A (純原生低碳技術) 納入：{stats['rule_a_high']:,}")
+print(f"規則 B (設備特徵 + 減碳節能動作) 納入：{stats['rule_b_medium_action']:,}")
 print(f"最後輸出筆數：{len(filtered_records):,}")
 print(f"輸出檔案：{out}")
 print("====================================")

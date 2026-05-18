@@ -1,44 +1,63 @@
 # =============================================================================
-# 碳捕捉專利 BERTopic 動態主題建模 Pipeline(針對碳中和領域)
-# Stage 1–7：資料載入 → SPECTER2 → UMAP → HDBSCAN → c-TF-IDF → 主題優化 → TOT
+# 碳捕捉專利 BERTopic 動態主題建模 Pipeline v2(對齊方法論)
+# Stage 1–7:資料載入 → SPECTER2 → UMAP → HDBSCAN → c-TF-IDF
+#           → KeyBERT+MMR+LLM 表示法微調 → TOT
+# -----------------------------------------------------------------------------
+# 主要調整(對齊方法論):
+#  Stage 1:只做物理清洗,保留標點、停用詞、大小寫,供 Transformer 完整理解語意
+#  Stage 2:加入 embedding 快取(.npy),避免反覆計算
+#  Stage 5:停用詞與小寫化的「真正落腳點」,只影響 c-TF-IDF 關鍵字展示
+#  Stage 6:加入 KeyBERTInspired → MMR → OpenAI GPT-4o-mini 英文標籤微調流水線
 # =============================================================================
 
-# ── 安裝套件（首次執行時取消註解）──────────────────────────────────────────
-# pip install bertopic sentence-transformers umap-learn hdbscan pandas pyarrow adapters
+# ── 安裝套件(首次執行時取消註解)──────────────────────────────────────────
+# pip install bertopic sentence-transformers umap-learn hdbscan pandas pyarrow
+# pip install adapters openai>=1.0 tiktoken
 
+import os
 import re
 import json
 import warnings
 from html import unescape
-import pandas as pd
-import numpy as np
-import torch
 from pathlib import Path
-import os
+
+import numpy as np
+import pandas as pd
+import torch
+
 try:
     from dotenv import load_dotenv
 except ImportError:
     load_dotenv = None
-
-
 
 from transformers import AutoTokenizer
 from umap import UMAP
 from hdbscan import HDBSCAN
 from bertopic import BERTopic
 from bertopic.vectorizers import ClassTfidfTransformer
+from bertopic.representation import (
+    KeyBERTInspired,
+    MaximalMarginalRelevance,
+    OpenAI as OpenAIRepresentation,
+)
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 
 warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_DIR / "output_specter2_3000"
+EMBEDDING_CACHE = OUTPUT_DIR / "specter2_embeddings.npy"
+EMBEDDING_INDEX = OUTPUT_DIR / "specter2_embeddings_index.parquet"
+EMBEDDING_INPUT_MODE = "abstract_only"
 
 
-def configure_huggingface_token() -> str | None:
+# =============================================================================
+# 環境變數設定(HuggingFace + OpenAI)
+# =============================================================================
+
+def configure_env_tokens() -> tuple[str | None, str | None]:
     """
-    從 .env 載入 Hugging Face token。
-    支援標準名稱 HF_TOKEN / HUGGINGFACE_HUB_TOKEN，也相容既有的 HF_API_TOKEN。
+    從 /home/carbon/carbon/.env 載入 HF_TOKEN 與 OPENAI_API_KEY。
     """
     if load_dotenv is not None:
         load_dotenv(PROJECT_DIR / ".env")
@@ -52,25 +71,24 @@ def configure_huggingface_token() -> str | None:
                 key, value = line.split("=", 1)
                 os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
-    token = (
+    hf_token = (
         os.getenv("HF_TOKEN")
         or os.getenv("HUGGINGFACE_HUB_TOKEN")
         or os.getenv("HF_API_TOKEN")
     )
+    if hf_token:
+        os.environ.setdefault("HF_TOKEN", hf_token)
+        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
 
-    if token:
-        os.environ.setdefault("HF_TOKEN", token)
-        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", token)
+    openai_key = os.getenv("OPENAI_API_KEY")
 
-    return token
+    return hf_token, openai_key
 
 
 # =============================================================================
-# 共用停用詞設定
+# Stage 5 專用停用詞(注意:Stage 1 不再使用)
 # =============================================================================
 
-# 專利法律套語、英語功能詞，以及本資料集中高頻但低辨識力的說明詞。
-# 保留 carbon、gas、water、catalyst、filter、membrane 等技術詞，避免削弱主題語意。
 PATENT_STOPWORDS = {
     "abstract", "according", "apparatus", "background", "claim", "claims",
     "comprise", "comprises", "comprising", "configure", "configured",
@@ -89,11 +107,9 @@ PATENT_STOPWORDS = {
 CORPUS_STOPWORDS = {
     "based", "can", "containing", "contains", "each", "first", "formed",
     "forming", "having", "one", "portion", "two",
-    # 專利裝置描述中常見的位置/形狀詞，容易讓 Topic 0 變成結構詞集合。
     "end", "ends", "opening", "openings", "wall", "walls", "inlet", "inlets",
     "outlet", "outlets", "upper", "lower", "inner", "outer", "side", "sides",
     "surface", "surfaces", "member", "members",
-    # 本資料集中常見但主題辨識力偏弱的泛用描述詞。
     "high", "low", "equal", "material", "materials", "space", "spaces",
     "content", "percent", "chamber", "chambers", "line", "lines", "main",
     "level", "region", "regions", "image", "images", "imaging", "lens",
@@ -102,6 +118,8 @@ CORPUS_STOPWORDS = {
     "partially", "uninterruptedly", "directly", "indirectly", "deals",
     "substance", "substances", "matter", "average", "layer", "visual",
     "information", "body", "export", "batch", "ls", "al", "vtd", "pgm", "pcd",
+    "wt", "weight", "mass", "temperature", "degree", "celsius", "pressure",
+    "mm", "vol", "lb", "btu",
 }
 
 CUSTOM_STOPWORDS = sorted(
@@ -110,141 +128,128 @@ CUSTOM_STOPWORDS = sorted(
 
 
 # =============================================================================
-# STAGE 1：數據載入與前處理 (Data Input)
+# STAGE 1:資料載入與「物理清洗」(對齊方法論:不做語意閹割)
 # =============================================================================
 
 def stage1_load_and_preprocess(input_path: str):
     """
-    讀取 JSON 或 Parquet 格式專利資料集，提取 abstract_en 並進行文字前處理。
-    確保每筆摘要與 application_number、priority_date 精準對應。
+    讀取 JSON / Parquet,僅做物理清洗:
+      - HTML entity 解碼
+      - 移除 HTML / XML 標籤與殘留 token
+      - 壓縮多餘空白
+    保留:大小寫、標點符號、停用詞、完整句型結構
+    (因為 SPECTER2 需要完整上下文才能精準理解技術語意)
     """
 
     print("=" * 60)
-    print("STAGE 1：數據載入與前處理")
+    print("STAGE 1:資料載入與物理清洗(保留完整句型供 Transformer 理解)")
     print("=" * 60)
 
     # ── 1.1 讀取資料 ──────────────────────────────────────────────────────
     data_path = Path(input_path)
-
     if data_path.is_file() and data_path.suffix.lower() == ".json":
-        print(f"讀取 JSON 檔案：{data_path}")
+        print(f"讀取 JSON 檔案:{data_path}")
         with data_path.open("r", encoding="utf-8") as f:
             df = pd.DataFrame(json.load(f))
     else:
         parquet_files = list(data_path.glob("*.parquet"))
-
         if not parquet_files:
             raise FileNotFoundError(f"在 {input_path} 找不到任何 .parquet 檔案")
-
-        print(f"找到 {len(parquet_files)} 個 Parquet 檔案，開始讀取...")
-
+        print(f"找到 {len(parquet_files)} 個 Parquet 檔案,開始讀取...")
         df = pd.concat(
-            [pd.read_parquet(f) for f in parquet_files],
-            ignore_index=True
+            [pd.read_parquet(f) for f in parquet_files], ignore_index=True
         )
-    print(f"原始資料筆數：{len(df):,}")
+    print(f"原始資料筆數:{len(df):,}")
 
     # ── 1.2 保留核心欄位 ──────────────────────────────────────────────────
     required_cols = ["application_number", "priority_date", "abstract_en"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"缺少必要欄位：{missing}，請確認資料集欄位名稱")
+        raise ValueError(f"缺少必要欄位:{missing}")
 
     optional_cols = [
-        "publication_number",
-        "title_en",
-        "matched_cpc_codes",
-        "domain_matched_prefixes",
-        "target_matched_prefixes",
+        "publication_number", "title_en",
+        "matched_cpc_codes", "domain_matched_prefixes", "target_matched_prefixes",
     ]
     keep_cols = required_cols + [c for c in optional_cols if c in df.columns]
     df = df[keep_cols].copy()
 
-    # ── 1.3 移除空值與空字串 ──────────────────────────────────────────────
+    # ── 1.3 移除空值 ──────────────────────────────────────────────────────
     before = len(df)
     df = df.dropna(subset=["abstract_en"])
-    df = df[df["abstract_en"].str.strip() != ""]
-    print(f"移除 Abstract 空值：{before - len(df):,} 筆 → 剩餘 {len(df):,} 筆")
+    df = df[df["abstract_en"].astype(str).str.strip() != ""]
+    print(f"移除 Abstract 空值:{before - len(df):,} 筆 → 剩餘 {len(df):,} 筆")
 
-    # ── 1.4 文字前處理 ────────────────────────────────────────────────────
-    print("執行文字前處理（轉小寫、去停用詞、去雜訊）...")
+    # ── 1.4 物理清洗(只做這幾件事)────────────────────────────────────
+    print("執行物理清洗:HTML 解碼 + 移除 tag + 壓縮空白")
+    print("(保留大小寫、標點符號、停用詞 → 供 SPECTER2 完整理解語意)")
 
-    def clean_abstract(text: str) -> str:
-        """
-        清洗單筆 Abstract：
-        1. HTML entity 解碼並移除 tag
-        2. 轉小寫
-        3. 移除數字與特殊符號（保留字母與空白）
-        4. 移除多餘空白與 HTML 殘留 token
-        5. 移除專利法律套語停用詞
-        """
+    def physical_clean(text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        # 1) HTML entity 解碼(&amp; → &, &lt; → <, etc.)
         text = unescape(text)
+        # 2) 移除 HTML / XML 標籤
         text = re.sub(r"<[^>]+>", " ", text)
-        # 轉小寫
-        text = text.lower()
-        # 常見 html/xml 殘留字串先清掉，避免產生 lt / gt / sub 之類雜訊 token
-        text = re.sub(r"&[a-z]+;", " ", text)
-        # 移除非字母字元（保留空白）
-        text = re.sub(r"[^a-z\s]", " ", text)
-        # 移除多餘空白
+        # 3) 移除殘留的 HTML entity 文字形式(若 unescape 後仍存在)
+        text = re.sub(r"&[a-zA-Z]+;", " ", text)
+        text = re.sub(r"&#\d+;", " ", text)
+        # 4) 壓縮多餘空白(包含換行、tab)
         text = re.sub(r"\s+", " ", text).strip()
-        # 移除停用詞（完整單字比對）
-        tokens = [t for t in text.split() if t not in CUSTOM_STOPWORDS]
-        return " ".join(tokens)
+        return text
 
-    df["abstract_clean"] = df["abstract_en"].apply(clean_abstract)
+    df["abstract_clean"] = df["abstract_en"].apply(physical_clean)
+    if "title_en" in df.columns:
+        df["title_clean"] = df["title_en"].apply(physical_clean)
+    else:
+        df["title_clean"] = ""
 
-    # ── 1.5 移除清洗後過短的摘要（< 30 個單詞）────────────────────────────
+    # ── 1.5 篩除過短摘要(< 30 個 token,以空白切)──────────────────────
     before = len(df)
     df["word_count"] = df["abstract_clean"].apply(lambda x: len(x.split()))
     df = df[df["word_count"] >= 30]
-    print(f"移除單詞數 < 30 的摘要：{before - len(df):,} 筆 → 剩餘 {len(df):,} 筆")
+    print(f"移除 word_count < 30 的摘要:{before - len(df):,} 筆 → 剩餘 {len(df):,} 筆")
 
-    # ── 1.6 priority_date 型別轉換 ────────────────────────────────────────
+    # ── 1.6 priority_date 型別轉換與時間區段標記 ──────────────────────────
     df["priority_date"] = pd.to_datetime(
-        df["priority_date"].astype(str),
-        format="%Y%m%d",
-        errors="coerce"
+        df["priority_date"].astype(str), format="%Y%m%d", errors="coerce"
     )
     df = df.dropna(subset=["priority_date"])
 
-    # ── 1.7 時間區段標記（依 priority_date）──────────────────────────────
     def assign_segment(date):
-        year = date.year
-        if 2006 <= year <= 2010:   return "SEG_A_2006_2010"
-        elif 2011 <= year <= 2015: return "SEG_B_2011_2015"
-        elif 2016 <= year <= 2020: return "SEG_C_2016_2020"
-        elif 2021 <= year <= 2025: return "SEG_D_2021_2025"
-        else:                       return "OUT_OF_RANGE"
+        y = date.year
+        if 2006 <= y <= 2010: return "SEG_A_2006_2010"
+        if 2011 <= y <= 2015: return "SEG_B_2011_2015"
+        if 2016 <= y <= 2020: return "SEG_C_2016_2020"
+        if 2021 <= y <= 2025: return "SEG_D_2021_2025"
+        return "OUT_OF_RANGE"
 
     df["time_segment"] = df["priority_date"].apply(assign_segment)
     df = df[df["time_segment"] != "OUT_OF_RANGE"].reset_index(drop=True)
 
+    # ── 1.7 建立 BERTopic 與 SPECTER2 的輸入文本 ──────────────────────────
+    # BERTopic 文件輸入:用物理清洗後的 abstract(保留完整句型)
+    # CountVectorizer 會在 Stage 5 自行做小寫化 + 停用詞過濾
     abstracts = df["abstract_clean"].tolist()
-    if "title_en" in df.columns:
-        embedding_texts = (
-            df["title_en"].fillna("").astype(str).str.strip()
-            + " [SEP] "
-            + df["abstract_en"].fillna("").astype(str).str.strip()
-        ).tolist()
-    else:
-        embedding_texts = df["abstract_en"].fillna("").astype(str).tolist()
 
-    print("\n各時間區段樣本數：")
+    # SPECTER2 嵌入輸入:僅使用 abstract
+    embedding_texts = df["abstract_clean"].astype(str).str.strip().tolist()
+
+    print("\n各時間區段樣本數:")
     print(df["time_segment"].value_counts().sort_index().to_string())
-    print(f"\nSTAGE 1 完成，最終語料筆數：{len(df):,}\n")
+    print(f"\nSTAGE 1 完成,最終語料筆數:{len(df):,}\n")
 
     return df, abstracts, embedding_texts
 
 
 # =============================================================================
-# STAGE 2：科學語義嵌入 (Scientific Embedding - SPECTER2)
+# STAGE 2:SPECTER2 科學語義嵌入 + 快取
 # =============================================================================
 
 class Specter2Embedder:
     """
-    使用 allenai/specter2_base 搭配 allenai/specter2 proximity adapter。
-    SPECTER2 官方建議用 title + abstract 產生科學文獻語義向量。
+    SPECTER2 base + proximity adapter,以 [CLS] token 作為文獻向量。
+    亦提供 encode() 介面,可作為 BERTopic representation_model 的 embedding_model。
     """
 
     def __init__(self, token: str | None = None):
@@ -252,257 +257,340 @@ class Specter2Embedder:
             from adapters import AutoAdapterModel
         except ImportError as exc:
             raise ImportError(
-                "使用 SPECTER2 需要先安裝 adapters："
-                "/home/carbon/carbon/.venv/bin/python -m pip install -U adapters"
+                "使用 SPECTER2 需先安裝 adapters:pip install -U adapters"
             ) from exc
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            "allenai/specter2_base",
-            token=token,
+            "allenai/specter2_base", token=token
         )
         self.model = AutoAdapterModel.from_pretrained(
-            "allenai/specter2_base",
-            token=token,
+            "allenai/specter2_base", token=token
         )
         self.model.load_adapter(
-            "allenai/specter2",
-            source="hf",
-            load_as="specter2",
-            set_active=True,
+            "allenai/specter2", source="hf",
+            load_as="specter2", set_active=True,
         )
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
         self.model.eval()
 
-    def encode(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
+    def encode(
+        self,
+        texts: list[str],
+        batch_size: int = 32,
+        show_progress_bar: bool = False,  # 相容 sentence-transformers 介面
+        convert_to_numpy: bool = True,
+        **kwargs,
+    ) -> np.ndarray:
+        if isinstance(texts, str):
+            texts = [texts]
         embeddings = []
         total = len(texts)
-
         for start in range(0, total, batch_size):
             batch = texts[start:start + batch_size]
             inputs = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-                return_token_type_ids=False,
+                batch, padding=True, truncation=True,
+                return_tensors="pt", return_token_type_ids=False,
                 max_length=512,
             )
-            inputs = {key: value.to(self.device) for key, value in inputs.items()}
-
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
             with torch.no_grad():
-                output = self.model(**inputs)
-                batch_embeddings = output.last_hidden_state[:, 0, :].cpu().numpy()
-
-            embeddings.append(batch_embeddings)
-            print(f"  embedded {min(start + batch_size, total):,}/{total:,}")
-
+                out = self.model(**inputs)
+                vec = out.last_hidden_state[:, 0, :].cpu().numpy()
+            embeddings.append(vec)
+            if show_progress_bar or total > 200:
+                print(f"  embedded {min(start + batch_size, total):,}/{total:,}")
         return np.vstack(embeddings)
 
 
-def stage2_embed(embedding_texts: list, batch_size: int = 32):
+def stage2_embed(
+    embedding_texts: list,
+    df: pd.DataFrame,
+    batch_size: int = 32,
+    use_cache: bool = True,
+):
     """
-    使用 SPECTER2 將 title + abstract 轉化為 768 維語義向量。
+    SPECTER2 嵌入 + .npy 快取機制
+      - 若快取存在且筆數一致,直接讀取
+      - 否則重新計算並寫入快取
     """
 
     print("=" * 60)
-    print("STAGE 2：SPECTER2 語義嵌入")
+    print("STAGE 2:SPECTER2 語義嵌入(含快取)")
     print("=" * 60)
 
-    base_model_name = "allenai/specter2_base"
-    adapter_name = "allenai/specter2"
-    print(f"載入 base model：{base_model_name}")
-    print(f"載入 adapter：{adapter_name}")
-    print("（首次執行需下載模型與 adapter，請耐心等候）\n")
-
-    hf_token = configure_huggingface_token()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    hf_token, _ = configure_env_tokens()
     if hf_token:
-        print("已從 .env / 環境變數載入 Hugging Face token")
+        print("已從 .env 載入 HF token")
 
     embedding_model = Specter2Embedder(token=hf_token)
 
-    print(f"開始嵌入 {len(embedding_texts):,} 筆 title + abstract（batch_size={batch_size}）...")
-    embeddings = embedding_model.encode(embedding_texts, batch_size=batch_size)
+    # ── 快取讀取 ──────────────────────────────────────────────────────────
+    if use_cache and EMBEDDING_CACHE.exists() and EMBEDDING_INDEX.exists():
+        cached_idx = pd.read_parquet(EMBEDDING_INDEX)
+        if (
+            len(cached_idx) == len(df)
+            and "embedding_input_mode" in cached_idx.columns
+            and (cached_idx["embedding_input_mode"] == EMBEDDING_INPUT_MODE).all()
+            and (
+                cached_idx["application_number"].values
+                == df["application_number"].values
+            ).all()
+        ):
+            print(f"從快取載入:{EMBEDDING_CACHE.name}")
+            embeddings = np.load(EMBEDDING_CACHE)
+            print(f"快取 shape:{embeddings.shape}\n")
+            return embedding_model, embeddings
+        else:
+            print("快取與當前資料不一致,重新計算 embedding")
 
-    print(f"\nSTAGE 2 完成，嵌入矩陣維度：{embeddings.shape}")
-    print(f"（{embeddings.shape[0]:,} 筆 × {embeddings.shape[1]} 維）\n")
+    # ── 重新計算 ──────────────────────────────────────────────────────────
+    print(f"嵌入 {len(embedding_texts):,} 筆 abstract(batch={batch_size})...")
+    embeddings = embedding_model.encode(embedding_texts, batch_size=batch_size)
+    print(f"嵌入矩陣 shape:{embeddings.shape}")
+
+    # ── 寫入快取 ──────────────────────────────────────────────────────────
+    np.save(EMBEDDING_CACHE, embeddings)
+    embedding_index = df[["application_number"]].copy()
+    embedding_index["embedding_input_mode"] = EMBEDDING_INPUT_MODE
+    embedding_index.to_parquet(EMBEDDING_INDEX, index=False)
+    print(f"已寫入快取:{EMBEDDING_CACHE.name}\n")
 
     return embedding_model, embeddings
 
 
 # =============================================================================
-# STAGE 3：非線性降維 (Dimensionality Reduction - UMAP)
+# STAGE 3:UMAP 降維
 # =============================================================================
 
 def stage3_umap() -> UMAP:
-    """
-    UMAP 將 768 維語義向量壓縮至 5 維。
-    使用餘弦相似度確保技術語義相近的專利在低維空間仍保持鄰近關係。
-    """
-
     print("=" * 60)
-    print("STAGE 3：UMAP 非線性降維設定")
+    print("STAGE 3:UMAP 降維設定")
     print("=" * 60)
-
     umap_model = UMAP(
-        n_neighbors=20,     # 拉高鄰居數，讓相近技術文本更容易形成穩定群
-        n_components=5,     # 壓縮至 5 維
-        min_dist=0.0,       # 允許緊密聚類
-        metric="cosine",    # 以餘弦相似度保留語義鄰近關係
-        random_state=42
+        n_neighbors=20,
+        n_components=5,
+        min_dist=0.0,
+        metric="cosine",
+        random_state=42,
     )
-
-    print("UMAP 設定：n_neighbors=20 | n_components=5 | metric=cosine\n")
+    print("UMAP:n_neighbors=20 | n_components=5 | metric=cosine\n")
     return umap_model
 
 
 # =============================================================================
-# STAGE 4：自動主題聚類 (Clustering - HDBSCAN)
+# STAGE 4:HDBSCAN 密度聚類
 # =============================================================================
 
 def stage4_hdbscan() -> HDBSCAN:
-    """
-    HDBSCAN 密度聚類，自動識別主題數量。
-    語義不明確的零散專利歸類為雜訊（Topic = -1）。
-    """
-
     print("=" * 60)
-    print("STAGE 4：HDBSCAN 自動主題聚類設定")
+    print("STAGE 4:HDBSCAN 聚類設定")
     print("=" * 60)
-
     hdbscan_model = HDBSCAN(
-        min_cluster_size=10,             # 降低成群門檻，讓中小型技術群不易被打成雜訊
-        min_samples=3,                   # 放寬核心點條件，降低 -1 比例
+        min_cluster_size=10,
+        min_samples=3,
         metric="euclidean",
-        cluster_selection_method="eom",  # eom 較能降低 leaf 帶來的高噪音比例
-        prediction_data=True             # 允許後續對新資料預測主題
+        cluster_selection_method="eom",
+        prediction_data=True,
     )
-
-    print("HDBSCAN 設定：min_cluster_size=10 | min_samples=3 | cluster_selection_method=eom\n")
+    print("HDBSCAN:min_cluster_size=10 | min_samples=3 | eom\n")
     return hdbscan_model
 
 
 # =============================================================================
-# STAGE 5：技術特徵提取 (Keyword Extraction - c-TF-IDF)
+# STAGE 5:c-TF-IDF(停用詞與小寫化的「真正落腳點」)
 # =============================================================================
 
 def stage5_vectorizer():
     """
-    CountVectorizer + ClassTfidfTransformer：
-    - trigram 支援 electric arc furnace、direct reduced iron 等鋼鐵技術詞
-    - 自定義停用詞排除法律套語
+    CountVectorizer 在此階段:
+      - lowercase=True(預設):此處才轉小寫,不影響 Stage 2 嵌入
+      - stop_words=CUSTOM_STOPWORDS:此處才去停用詞
+      - ngram_range=(1, 3):支援 electric arc furnace 等技術詞
     """
-
     print("=" * 60)
-    print("STAGE 5：c-TF-IDF 技術特徵提取設定")
+    print("STAGE 5:c-TF-IDF 特徵設定(停用詞與小寫化在此落腳)")
     print("=" * 60)
 
     vectorizer_model = CountVectorizer(
         ngram_range=(1, 3),
         stop_words=CUSTOM_STOPWORDS,
-        min_df=1,
-        max_df=1.0
+        lowercase=True,  # 明確標示:小寫化在這裡才發生
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_]+\b",
+        min_df=2,        # 略提高 min_df,過濾極稀有雜訊詞
+        max_df=0.95,     # 過濾跨主題高頻泛用詞
     )
+    ctfidf_model = ClassTfidfTransformer(reduce_frequent_words=True)
 
-    ctfidf_model = ClassTfidfTransformer(
-        reduce_frequent_words=True
-    )
-
-    print(f"Vectorizer 設定：unigram/bigram/trigram | min_df=1 | max_df=1.0")
-    print(f"停用詞數量：{len(CUSTOM_STOPWORDS)}\n")
-
+    print(f"Vectorizer:unigram/bigram/trigram | min_df=2 | max_df=0.95")
+    print(f"停用詞數量:{len(CUSTOM_STOPWORDS)}\n")
     return vectorizer_model, ctfidf_model
 
 
 # =============================================================================
-# STAGE 6：主題建模訓練 + 優化與標籤生成
+# STAGE 6:BERTopic 訓練 + 表示法多層級微調(KeyBERT → MMR → LLM)
 # =============================================================================
+
+LLM_LABEL_PROMPT = """You are an expert in patent technology classification, specifically in the domains of carbon capture, carbon neutrality, ironmaking, steelmaking, and metallurgy.
+
+I have a topic that contains the following representative patent abstracts:
+[DOCUMENTS]
+
+The topic is described by the following keywords: [KEYWORDS]
+
+Based on the documents and keywords above, generate ONE concise and specific topic label.
+
+STRICT REQUIREMENTS:
+1. The label MUST be written in English.
+2. The label MUST be under 8 words.
+3. Use precise technical terminology from the carbon-neutral metallurgy / ironmaking / steelmaking domain (e.g., hydrogen shaft furnace, direct reduced iron, electric arc furnace, converter gas recovery, pulverized coal injection, submerged arc furnace, waste heat recovery, red mud valorization).
+4. Reflect the SPECIFIC core technology shown in the documents, not generic concepts like "system", "method", "device", or "apparatus".
+5. Do NOT include numbering, quotation marks, punctuation, or any explanation.
+6. Output ONLY the English label on a single line.
+
+Example outputs (format reference only, do not copy):
+Blast Furnace Energy Optimization
+Blast Furnace Waste Heat Recovery
+Hydrogen Shaft Furnace DRI
+Hydrogen Metallurgy Ironmaking
+Low Carbon Reductant Injection
+Electric Arc Furnace Scrap Recycling
+Electric Arc Furnace Energy Efficiency
+Converter Gas Heat Recovery
+Steelmaking Off Gas CCUS
+Smart Energy Monitoring
+Slag Byproduct Valorization
+Red Mud Iron Recovery
+
+Topic label:"""
+
+
+def build_representation_model(
+    embedding_model,
+    openai_key: str | None,
+    include_llm: bool = True,
+):
+    """
+    建立三層串聯的表示法微調流水線:
+      Main 關鍵字:[KeyBERTInspired → MMR]
+      English_Label:OpenAI GPT-4o-mini(英文標籤,可選)
+    """
+    # ── 第一層:KeyBERTInspired(語意過濾)──────────────────────────────
+    keybert = KeyBERTInspired(
+        top_n_words=20,        # 候選詞池
+        nr_repr_docs=5,        # 代表文件數
+        nr_samples=500,        # 取樣文件數
+        nr_candidate_words=100,
+    )
+
+    # ── 第二層:MMR(多樣性去重)───────────────────────────────────────
+    mmr = MaximalMarginalRelevance(diversity=0.4)  # 0.4 兼顧多樣性與相關性
+
+    # ── 第三層:OpenAI GPT-4o-mini(英文標籤)─────────────────────
+    rep_dict = {
+        "Main": [keybert, mmr],
+    }
+
+    if include_llm and openai_key:
+        try:
+            import openai
+            client = openai.OpenAI(api_key=openai_key)
+            english_label = OpenAIRepresentation(
+                client=client,
+                model="gpt-4o-mini",      # 可改 gpt-4o 取得更高品質英文標籤
+                chat=True,
+                prompt=LLM_LABEL_PROMPT,
+                nr_docs=3,                # 餵 3 篇最具代表性的摘要
+                doc_length=300,           # 每篇摘要截斷至 300 token
+                tokenizer="char",
+                delay_in_seconds=1,
+            )
+            rep_dict["English_Label"] = english_label
+            print("  ✓ OpenAI GPT-4o-mini 已掛載,將產生英文主題標籤")
+        except Exception as e:
+            print(f"  ✗ OpenAI 初始化失敗(略過 LLM 標籤):{e}")
+    elif include_llm:
+        print("  ⚠ 未提供 OPENAI_API_KEY,跳過 LLM 英文標籤生成")
+
+    return rep_dict
+
 
 def stage6_train_and_refine(
     abstracts, df, embedding_model, embeddings,
     umap_model, hdbscan_model, vectorizer_model, ctfidf_model,
-    target_topics: int = 20,
+    target_topics: int = 50,
     apply_outlier_reduction: bool = False,
 ):
     """
-    BERTopic 完整訓練流程：
-    1. 初始建模，保留 HDBSCAN 找到的原始主題
-    2. 若主題數過多，再收斂至 15–20 個
-    3. 主題關鍵詞輸出
-    4. Topic ID 與標籤回填至原始 DataFrame
+    BERTopic 訓練 + 表示法多層級微調 + Topic ID 回填
     """
 
     print("=" * 60)
-    print("STAGE 6：BERTopic 主題建模訓練與優化")
+    print("STAGE 6:BERTopic 訓練 + KeyBERT → MMR → LLM 表示法微調")
     print("=" * 60)
 
-    # ── 6.1 建立模型 ──────────────────────────────────────────────────────
+    _, openai_key = configure_env_tokens()
+    keyword_representation_model = build_representation_model(
+        embedding_model, openai_key=None, include_llm=False
+    )
+    final_representation_model = build_representation_model(
+        embedding_model, openai_key, include_llm=True
+    )
+
+    # ── 6.1 建模 ──────────────────────────────────────────────────────────
+    # embedding_model 傳入 SPECTER2 是為了讓 KeyBERTInspired 能對候選詞重新嵌入
+    # 訓練/收斂階段先不掛 OpenAI,避免對會被合併的暫時主題產生標籤成本
     topic_model = BERTopic(
-        embedding_model=None,  # 使用 stage2 預先計算的 SPECTER2 embeddings
+        embedding_model=embedding_model,
         umap_model=umap_model,
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
         ctfidf_model=ctfidf_model,
-        nr_topics=None,
+        representation_model=keyword_representation_model,
+        nr_topics=target_topics,
         top_n_words=10,
-        calculate_probabilities=True,
-        verbose=True
+        calculate_probabilities=False,  # 提速;若需 probs 再開啟
+        verbose=True,
     )
 
-    # ── 6.2 訓練（傳入預計算的 embeddings 加速）──────────────────────────
-    print("\n開始訓練 BERTopic 模型...")
+    # ── 6.2 訓練(傳入預計算 embeddings)─────────────────────────────────
+    print("\n開始訓練 BERTopic...")
     topics, probs = topic_model.fit_transform(abstracts, embeddings)
 
     initial_count = len(set(topics)) - (1 if -1 in topics else 0)
-    noise_count   = list(topics).count(-1)
-    print(f"\n初始建模結果：識別主題數 = {initial_count} | 雜訊專利 = {noise_count:,}")
+    noise_count = list(topics).count(-1)
+    print(f"主題收斂後主題數:{initial_count} | 雜訊:{noise_count:,}")
 
-    # ── 6.3 主題收斂 ──────────────────────────────────────────────────────
-    if initial_count > target_topics:
-        print(f"主題數 {initial_count} > 目標 {target_topics}，執行 reduce_topics...")
-        topic_model.reduce_topics(abstracts, nr_topics=target_topics)
-        topics = topic_model.topics_
-        final_count = len(set(topics)) - (1 if -1 in topics else 0)
-        print(f"收斂後主題數：{final_count}")
+    # ── 6.3 雜訊重新分配(可選)──────────────────────────────────────
+    noise_before = list(topic_model.topics_).count(-1)
+    if apply_outlier_reduction and noise_before:
+        print(f"執行 reduce_outliers,目前雜訊:{noise_before:,}")
+        new_topics = topic_model.reduce_outliers(
+            abstracts, topic_model.topics_,
+            strategy="c-tf-idf",
+            threshold=0.09,
+        )
+        topic_model.topics_ = new_topics
 
-    # ── 6.3b 視需要將部分雜訊文件重新分配回最相近主題 ───────────────────
-    noise_before_reduction = list(topic_model.topics_).count(-1)
-    if apply_outlier_reduction and noise_before_reduction:
-        print(
-            f"偵測到 {noise_before_reduction:,} 筆雜訊，"
-            "嘗試以 embeddings 策略執行 reduce_outliers..."
-        )
-        reassigned_topics = topic_model.reduce_outliers(
-            abstracts,
-            topic_model.topics_,
-            embeddings=embeddings,
-            strategy="embeddings",
-        )
-        topic_model.topics_ = reassigned_topics
-        df = df.copy()
-        df["topic_id"] = reassigned_topics
-        print(
-            "reduce_outliers 完成，剩餘雜訊："
-            f"{list(reassigned_topics).count(-1):,}"
-        )
-    elif noise_before_reduction:
-        print(
-            f"保留 {noise_before_reduction:,} 筆雜訊，不執行 reduce_outliers，"
-            "以避免大主題過度膨脹。"
-        )
+    # 重要:主題收斂與雜訊重分配後才掛 OpenAI,只為最終主題產生標籤
+    topic_model.update_topics(
+        abstracts,
+        topics=topic_model.topics_,
+        vectorizer_model=vectorizer_model,
+        ctfidf_model=ctfidf_model,
+        representation_model=final_representation_model,
+    )
 
     final_topics = topic_model.topics_
     final_count = len(set(final_topics)) - (1 if -1 in final_topics else 0)
-    final_noise_count = final_topics.count(-1)
-    final_noise_ratio = final_noise_count / len(final_topics) if final_topics else 0
-    print(
-        f"最終建模結果：主題數 = {final_count} | "
-        f"雜訊專利 = {final_noise_count:,} ({final_noise_ratio:.1%})"
-    )
+    final_noise = list(final_topics).count(-1)
+    print(f"最終主題數:{final_count} | 雜訊:{final_noise:,} "
+          f"({final_noise / len(final_topics):.1%})")
 
-    # ── 6.4 輸出主題關鍵詞 ────────────────────────────────────────────────
+    # ── 6.4 輸出主題關鍵字 + 英文標籤 ────────────────────────────────────
     print("\n" + "=" * 60)
-    print("主題關鍵詞摘要（Top-10 技術詞彙）")
+    print("主題關鍵字 + 英文標籤")
     print("=" * 60)
 
     topic_info = topic_model.get_topic_info()
@@ -510,44 +598,67 @@ def stage6_train_and_refine(
 
     keyword_rows = []
     for _, row in topic_info.iterrows():
-        tid      = row["Topic"]
-        words    = topic_model.get_topic(tid)
+        tid = row["Topic"]
+        words = topic_model.get_topic(tid)
         keywords = " | ".join([w for w, _ in words[:10]])
+
+        # 取 LLM 標籤(若有)
+        english_label = ""
+        if "English_Label" in topic_info.columns:
+            raw = row.get("English_Label", "")
+            if isinstance(raw, list) and raw:
+                english_label = str(raw[0]).strip()
+            elif isinstance(raw, str):
+                english_label = raw.strip()
+
         keyword_rows.append({
-            "Topic_ID"      : tid,
-            "Doc_Count"     : row["Count"],
-            "Top10_Keywords": keywords
+            "Topic_ID": tid,
+            "English_Label": english_label,
+            "Doc_Count": row["Count"],
+            "Top10_Keywords": keywords,
         })
-        print(f"Topic {tid:>3} ({row['Count']:>5} 筆)：{keywords}")
+
+        label_show = english_label if english_label else "(無 LLM 標籤)"
+        print(f"Topic {tid:>3} ({row['Count']:>5} 筆) {label_show}")
+        print(f"          {keywords}")
 
     keywords_df = pd.DataFrame(keyword_rows)
 
-    # ── 6.5 回填 Topic ID 與標籤至 DataFrame ─────────────────────────────
+    # ── 6.5 回填 Topic ID + English_Label 至 DataFrame ───────────────────
     df = df.copy()
-    df["topic_id"]    = topic_model.topics_
+    df["topic_id"] = topic_model.topics_
+
+    label_map = dict(zip(keywords_df["Topic_ID"], keywords_df["English_Label"]))
     df["topic_label"] = df["topic_id"].apply(
-        lambda t: f"Topic_{t}" if t != -1 else "NOISE"
+        lambda t: label_map.get(t, "") if t != -1 else "NOISE"
     )
 
-    # ── 6.6 儲存結果 ──────────────────────────────────────────────────────
-    output_dir = OUTPUT_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    df.to_parquet(output_dir / "patent_with_topics.parquet", index=False)
+    # ── 6.6 儲存 ──────────────────────────────────────────────────────────
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(OUTPUT_DIR / "patent_with_topics.parquet", index=False)
     keywords_df.to_csv(
-        output_dir / "topic_keywords.csv", index=False, encoding="utf-8-sig"
+        OUTPUT_DIR / "topic_keywords.csv", index=False, encoding="utf-8-sig"
     )
+    # 儲存 BERTopic 模型本身(可重新載入做 TOT)
+    try:
+        topic_model.save(
+            OUTPUT_DIR / "bertopic_model",
+            serialization="safetensors",
+            save_ctfidf=True,
+            save_embedding_model=False,
+        )
+        print(f"\nBERTopic 模型已儲存:{OUTPUT_DIR / 'bertopic_model'}")
+    except Exception as e:
+        print(f"\nBERTopic 模型儲存失敗(略過):{e}")
 
-    print(f"\n結果已儲存至 {output_dir}")
-    print("  ├── patent_with_topics.parquet（含 topic_id、topic_label）")
-    print("  └── topic_keywords.csv（主題關鍵詞摘要表）")
+    print(f"結果已儲存至:{OUTPUT_DIR}")
     print(f"\nSTAGE 6 完成\n")
 
     return topic_model, df, keywords_df
 
 
 # =============================================================================
-# STAGE 7：Topics over Time 動態主題分析
+# STAGE 7:Topics over Time(與 v1 相同邏輯)
 # =============================================================================
 
 def classify_trajectory(freq, shares):
@@ -572,136 +683,102 @@ def classify_trajectory(freq, shares):
 
 
 def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
-    """
-    以 priority_date 切分的 4 個時間區段作為時間標籤，
-    執行 Topics over Time 分析，輸出技術演進趨勢與生命週期狀態標記。
-    """
-
     print("=" * 60)
-    print("STAGE 7：Topics over Time 動態主題分析")
+    print("STAGE 7:Topics over Time 動態分析")
     print("=" * 60)
 
     SEGMENTS = [
-        "SEG_A_2006_2010",
-        "SEG_B_2011_2015",
-        "SEG_C_2016_2020",
-        "SEG_D_2021_2025"
+        "SEG_A_2006_2010", "SEG_B_2011_2015",
+        "SEG_C_2016_2020", "SEG_D_2021_2025",
     ]
-    segment_to_code = {segment: idx for idx, segment in enumerate(SEGMENTS)}
-    code_to_segment = {idx: segment for segment, idx in segment_to_code.items()}
+    segment_to_code = {s: i for i, s in enumerate(SEGMENTS)}
+    code_to_segment = {i: s for s, i in segment_to_code.items()}
 
-    # BERTopic 0.17.4 對字串 timestamps 會呼叫 pandas 3 已移除的參數。
-    # 先用數字代碼避開自動日期解析，再映射回原本的時間區段標籤。
     timestamps = df["time_segment"].map(segment_to_code).tolist()
 
     tot = topic_model.topics_over_time(
-        abstracts,
-        timestamps,
+        abstracts, timestamps,
         nr_bins=None,
-        evolution_tuning=True,   # 相鄰段語義連貫性
-        global_tuning=True       # 全域一致性，確保跨段可比
+        evolution_tuning=True,
+        global_tuning=True,
     )
-
     tot["Timestamp"] = tot["Timestamp"].map(code_to_segment)
+    tot.to_csv(OUTPUT_DIR / "topics_over_time.csv",
+               index=False, encoding="utf-8-sig")
+    print("TOT 已儲存:topics_over_time.csv")
 
-    output_dir = OUTPUT_DIR
-    tot.to_csv(output_dir / "topics_over_time.csv", index=False, encoding="utf-8-sig")
-    print("TOT 結果已儲存：topics_over_time.csv")
-
-    # ── 技術生命週期狀態標記 ──────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("技術生命週期狀態標記")
-    print("=" * 60)
-
+    # ── 生命週期 ──────────────────────────────────────────────────────────
+    label_map = dict(zip(keywords_df["Topic_ID"], keywords_df["English_Label"]))
     lifecycle_rows = []
-
     for tid in sorted(tot["Topic"].unique()):
         if tid == -1:
             continue
-
-        subset   = tot[tot["Topic"] == tid]
+        subset = tot[tot["Topic"] == tid]
         freq_map = dict(zip(subset["Timestamp"], subset["Frequency"]))
-        freq     = [freq_map.get(s, 0) for s in SEGMENTS]
-
-        early  = sum(freq[:2])
-        late   = sum(freq[2:])
+        freq = [freq_map.get(s, 0) for s in SEGMENTS]
+        early, late = sum(freq[:2]), sum(freq[2:])
         growth = (late - early) / (early + 1)
-
         if growth > 0.5 and freq[0] < freq[-1]:
-            status = " 新興"
+            status = "新興"
         elif growth < -0.3 and freq[0] > freq[-1]:
-            status = " 衰退"
+            status = "衰退"
         else:
-            status = " 成熟"
-
+            status = "成熟"
         lifecycle_rows.append({
-            "Topic_ID"   : tid,
-            "Freq_SEG_A" : freq[0],
-            "Freq_SEG_B" : freq[1],
-            "Freq_SEG_C" : freq[2],
-            "Freq_SEG_D" : freq[3],
+            "Topic_ID": tid,
+            "English_Label": label_map.get(tid, ""),
+            "Freq_SEG_A": freq[0], "Freq_SEG_B": freq[1],
+            "Freq_SEG_C": freq[2], "Freq_SEG_D": freq[3],
             "Growth_Rate": round(growth, 3),
-            "Status"     : status
+            "Status": status,
         })
-
-        print(
-            f"Topic {tid:>3} | "
-            f"A:{freq[0]:>4}  B:{freq[1]:>4}  C:{freq[2]:>4}  D:{freq[3]:>4} | "
-            f"成長率:{growth:>+6.2f} | {status}"
-        )
-
+        print(f"Topic {tid:>3} | A:{freq[0]:>4} B:{freq[1]:>4} "
+              f"C:{freq[2]:>4} D:{freq[3]:>4} | 成長:{growth:>+6.2f} | {status}")
     lifecycle_df = pd.DataFrame(lifecycle_rows)
-    lifecycle_df.to_csv(
-        output_dir / "topic_lifecycle.csv", index=False, encoding="utf-8-sig"
-    )
-    print(f"\n生命週期標記已儲存：topic_lifecycle.csv")
+    lifecycle_df.to_csv(OUTPUT_DIR / "topic_lifecycle.csv",
+                        index=False, encoding="utf-8-sig")
 
-    # ── 近 20 年演進軌跡輸出 ──────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("近 20 年技術演進軌跡分析")
-    print("=" * 60)
-
+    # ── 演進軌跡 ──────────────────────────────────────────────────────────
     topic_df = df[df["topic_id"] != -1].copy()
     topic_df["priority_year"] = topic_df["priority_date"].dt.year
 
     yearly_counts = pd.crosstab(topic_df["priority_year"], topic_df["topic_id"])
     yearly_counts = yearly_counts.reindex(range(2006, 2026), fill_value=0)
-    yearly_counts.to_csv(output_dir / "topic_yearly_counts.csv", encoding="utf-8-sig")
+    yearly_counts.to_csv(OUTPUT_DIR / "topic_yearly_counts.csv",
+                         encoding="utf-8-sig")
 
     yearly_totals = yearly_counts.sum(axis=1).replace(0, np.nan)
     yearly_shares = yearly_counts.div(yearly_totals, axis=0).fillna(0)
-    yearly_shares.to_csv(output_dir / "topic_yearly_shares.csv", encoding="utf-8-sig")
+    yearly_shares.to_csv(OUTPUT_DIR / "topic_yearly_shares.csv",
+                         encoding="utf-8-sig")
 
     segment_counts = pd.crosstab(topic_df["topic_id"], topic_df["time_segment"])
     segment_counts = segment_counts.reindex(columns=SEGMENTS, fill_value=0)
-    segment_counts.to_csv(output_dir / "topic_segment_counts.csv", encoding="utf-8-sig")
+    segment_counts.to_csv(OUTPUT_DIR / "topic_segment_counts.csv",
+                          encoding="utf-8-sig")
 
     segment_totals = topic_df["time_segment"].value_counts().reindex(SEGMENTS, fill_value=0)
     segment_shares = segment_counts.div(segment_totals.replace(0, np.nan), axis=1).fillna(0)
-    segment_shares.to_csv(output_dir / "topic_segment_shares.csv", encoding="utf-8-sig")
+    segment_shares.to_csv(OUTPUT_DIR / "topic_segment_shares.csv",
+                          encoding="utf-8-sig")
 
     keyword_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Top10_Keywords"]))
     count_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Doc_Count"]))
+    midpoints = np.array([2008, 2013, 2018, 2023], dtype=float)
 
     evolution_rows = []
-    segment_midpoints = np.array([2008, 2013, 2018, 2023], dtype=float)
-
-    for topic_id in sorted(segment_counts.index):
-        freq = [int(segment_counts.loc[topic_id, segment]) for segment in SEGMENTS]
-        shares = [float(segment_shares.loc[topic_id, segment]) for segment in SEGMENTS]
-        slope = float(np.polyfit(segment_midpoints, shares, 1)[0])
+    for tid in sorted(segment_counts.index):
+        freq = [int(segment_counts.loc[tid, s]) for s in SEGMENTS]
+        shares = [float(segment_shares.loc[tid, s]) for s in SEGMENTS]
+        slope = float(np.polyfit(midpoints, shares, 1)[0])
         peak_idx = int(np.argmax(freq))
-        keywords = keyword_map.get(topic_id, "")
-
         evolution_rows.append({
-            "Topic_ID": topic_id,
-            "Topic_Label": f"Topic_{topic_id}",
-            "Top10_Keywords": keywords,
-            "Doc_Count": int(count_map.get(topic_id, sum(freq))),
-            "Freq_2006_2010": freq[0],
-            "Freq_2011_2015": freq[1],
-            "Freq_2016_2020": freq[2],
-            "Freq_2021_2025": freq[3],
+            "Topic_ID": tid,
+            "English_Label": label_map.get(tid, ""),
+            "Top10_Keywords": keyword_map.get(tid, ""),
+            "Doc_Count": int(count_map.get(tid, sum(freq))),
+            "Freq_2006_2010": freq[0], "Freq_2011_2015": freq[1],
+            "Freq_2016_2020": freq[2], "Freq_2021_2025": freq[3],
             "Share_2006_2010": round(shares[0], 4),
             "Share_2011_2015": round(shares[1], 4),
             "Share_2016_2020": round(shares[2], 4),
@@ -711,22 +788,11 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
             "Peak_Segment": SEGMENTS[peak_idx],
             "Trajectory": classify_trajectory(freq, shares),
         })
-
     evolution_df = pd.DataFrame(evolution_rows)
-    evolution_df.to_csv(
-        output_dir / "topic_evolution_summary.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    evolution_df.to_csv(OUTPUT_DIR / "topic_evolution_summary.csv",
+                        index=False, encoding="utf-8-sig")
 
-    print("演進軌跡檔案已儲存：")
-    print("  ├── topic_yearly_counts.csv")
-    print("  ├── topic_yearly_shares.csv")
-    print("  ├── topic_segment_counts.csv")
-    print("  ├── topic_segment_shares.csv")
-    print("  └── topic_evolution_summary.csv")
     print(f"\nSTAGE 7 完成\n")
-
     return tot, lifecycle_df, evolution_df
 
 
@@ -735,46 +801,50 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 # =============================================================================
 
 if __name__ == "__main__":
-    # INPUT_PATH    = str(PROJECT_DIR / "data" / "part-000000000000_carbon_neutral_keywords.json")
-    INPUT_PATH    = str(PROJECT_DIR / "data_globalmorecpc" / "global_onlycpc_carbon_neutral_v2.json")
+    INPUT_PATH = str(PROJECT_DIR / "data_globalmorecpc" / "global_onlycpc_carbon_neutral_v2.json")
     TARGET_TOPICS = 50
-    # STAGE 1：載入與前處理
+
+    # STAGE 1:資料載入 + 物理清洗
     df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)
 
-    # STAGE 2：SPECTER2 嵌入
-    embedding_model, embeddings = stage2_embed(embedding_texts, batch_size=32)
+    # STAGE 2:SPECTER2 嵌入(含快取)
+    embedding_model, embeddings = stage2_embed(
+        embedding_texts, df, batch_size=32, use_cache=True
+    )
 
-    # STAGE 3：UMAP 降維設定
+    # STAGE 3:UMAP
     umap_model = stage3_umap()
 
-    # STAGE 4：HDBSCAN 聚類設定
+    # STAGE 4:HDBSCAN
     hdbscan_model = stage4_hdbscan()
 
-    # STAGE 5：c-TF-IDF 特徵提取設定
+    # STAGE 5:c-TF-IDF
     vectorizer_model, ctfidf_model = stage5_vectorizer()
 
-    # STAGE 6：訓練、優化、標籤生成
+    # STAGE 6:訓練 + 表示法多層級微調
     topic_model, df, keywords_df = stage6_train_and_refine(
         abstracts, df,
         embedding_model, embeddings,
         umap_model, hdbscan_model,
         vectorizer_model, ctfidf_model,
-        target_topics=TARGET_TOPICS
+        target_topics=TARGET_TOPICS,
+        apply_outlier_reduction=True,
     )
 
-    # STAGE 7：Topics over Time 動態分析
+    # STAGE 7:Topics over Time
     tot_df, lifecycle_df, evolution_df = stage7_topics_over_time(
         topic_model, df, abstracts, keywords_df
     )
 
     print("=" * 60)
     print("全流程執行完畢")
-    print(f"最終 DataFrame 欄位：{list(df.columns)}")
-    print("輸出目錄：/home/carbon/carbon/output_specter2/")
+    print(f"輸出目錄:{OUTPUT_DIR}")
+    print("  ├── specter2_embeddings.npy(嵌入快取)")
     print("  ├── patent_with_topics.parquet")
-    print("  ├── topic_keywords.csv")
+    print("  ├── topic_keywords.csv(含 English_Label 欄)")
     print("  ├── topics_over_time.csv")
-    print("  └── topic_lifecycle.csv")
+    print("  ├── topic_lifecycle.csv")
     print("  ├── topic_evolution_summary.csv")
-    print("  └── topic_yearly_counts.csv / topic_yearly_shares.csv")
+    print("  ├── topic_yearly_counts.csv / topic_yearly_shares.csv")
+    print("  └── bertopic_model/(模型 safetensors)")
     print("=" * 60)
