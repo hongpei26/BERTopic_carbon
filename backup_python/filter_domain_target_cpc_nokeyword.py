@@ -1,25 +1,25 @@
 import json
 import re
 from pathlib import Path
+from collections import Counter
 
 # =============================================================================
-# 依 CPC 代碼建立「鋼鐵領域」且「減碳/能源/資源循環目標」相關的候選池
+# 依 CPC 代碼篩選「鋼鐵領域」且「碳中和/減碳目標」相關的專利
 #
 # 篩選順序(嚴格依此順序執行):
 #   步驟一、時間過濾:priority_date 年份 ∈ [2006, 2025]
 #           - 空值、None、0、"0"、"00000000" 等一律跳過
 #           - 必須最先執行,後續所有計算都以時間過濾後的母體為準
 #   步驟二、CPC 篩選:
-#           減碳/能源/資源循環目標 CPC
+#           減碳目標 CPC
 #           AND
 #           C21B/C21C  (鋼鐵領域 CPC)
-#   注意:此步驟只建立 CPC candidate pool,不是最終碳中和專利判定。
 # =============================================================================
 
 # 輸入資料:前一步依 abstract_en 去重後的資料。
-src = Path("/home/carbon/carbon/data_globalmorecpc/global_abstract_dedup.json")
-# 輸出資料:同時命中目標 CPC 與鋼鐵領域 CPC 的候選池。
-out = Path("/home/carbon/carbon/data_globalmorecpc/global_cpc_candidate_pool.json")
+src = Path("/home/carbon/carbon/data_global_v2/Carbon_onlycpc_global_morecpc_v2/global_abstract_dedup.json")
+# 輸出資料:同時命中減碳目標 CPC 與鋼鐵領域 CPC 的資料。
+out = Path("/home/carbon/carbon/data_global_v2/Carbon_onlycpc_global_morecpc_v2/global_onlycpc_domain_target_intersection.json")
 
 
 # =============================================================================
@@ -35,8 +35,19 @@ DOMAIN_PREFIXES = [
     "C21C",  # 煉鋼精煉
 ]
 
-# 第二群組:核心鋼鐵減碳 CPC 前綴。
-CORE_TARGET_PREFIXES = [
+# 第二群組:碳中和、製程減碳、CO2 捕集/處理、氣體分離相關 CPC 前綴。
+TARGET_PREFIXES = [
+    # B01D:氣體分離 / 廢氣淨化 / CO2 捕集
+    "B01D53",
+    "B01D2053",
+
+    # Y02C:溫室氣體捕捉或處置
+    "Y02C20/10",
+    "Y02C20/20",
+    "Y02C20/30",
+    "Y02C20/40",
+
+    # Y02P10:金屬加工減碳
     "Y02P10/10",
     "Y02P10/122",
     "Y02P10/134",
@@ -45,17 +56,31 @@ CORE_TARGET_PREFIXES = [
     "Y02P10/20",
     "Y02P10/25",
     "Y02P10/32",
-    "Y02C20/40",
-]
 
-# 第三群組:輔助型 CPC,可建立候選池,但不能單獨代表鋼鐵碳中和。
-SUPPORT_TARGET_PREFIXES = [
-    "B01D53",
-    "B01D2053",
+    # Y02P20:化工產業減碳
+    "Y02P20/129",
+    "Y02P20/143",
+    "Y02P20/145",
+    "Y02P20/151",
+    "Y02P20/582",
+    "Y02P20/584",
+
+    # Y02P40:礦物加工減碳
+    "Y02P40/10",
+    "Y02P40/121",
+    "Y02P40/125",
+    "Y02P40/18",
+
+    # Y02P70:最終產品製程減碳
+    "Y02P70/10",
+
+    # Y02P80:跨產業能源效率、廢棄物減量、材料節省
     "Y02P80/10",
     "Y02P80/15",
     "Y02P80/30",
     "Y02P80/40",
+
+    # Y02P90:智慧製造、氫能、燃料電池、能源管理、GHG 管理
     "Y02P90/02",
     "Y02P90/30",
     "Y02P90/40",
@@ -66,8 +91,6 @@ SUPPORT_TARGET_PREFIXES = [
     "Y02P90/84",
     "Y02P90/845",
 ]
-
-TARGET_PREFIXES = CORE_TARGET_PREFIXES + SUPPORT_TARGET_PREFIXES
 
 
 # =============================================================================
@@ -205,31 +228,24 @@ for record in records:
 # 步驟二:CPC 篩選(只跑時間範圍內的資料)
 # -----------------------------------------------------------------------------
 filtered = []
+# 統計最終輸出資料中，第二群組每個 CPC 前綴的命中筆數
+filtered_target_prefix_counter = Counter()
 
 # 各條件命中筆數(以時間過濾後的母體計算)。
 domain_hit_count = 0
 target_hit_count = 0
-core_target_hit_count = 0
-support_target_hit_count = 0
 steel_domain_cpc_count = 0
-strength_counts = {"core": 0, "support": 0, "none": 0}
 
 for record in records_in_range:
     cpc_codes = get_cpc_codes(record)
 
     domain_hits = matched_prefixes(cpc_codes, DOMAIN_PREFIXES)
-    core_target_hits = matched_prefixes(cpc_codes, CORE_TARGET_PREFIXES)
-    support_target_hits = matched_prefixes(cpc_codes, SUPPORT_TARGET_PREFIXES)
-    target_hits = sorted(set(core_target_hits) | set(support_target_hits))
+    target_hits = matched_prefixes(cpc_codes, TARGET_PREFIXES)
 
     if domain_hits:
         domain_hit_count += 1
     if target_hits:
         target_hit_count += 1
-    if core_target_hits:
-        core_target_hit_count += 1
-    if support_target_hits:
-        support_target_hit_count += 1
 
     is_steel_domain = bool(domain_hits)
 
@@ -238,25 +254,18 @@ for record in records_in_range:
 
     # 篩選條件:減碳目標 CPC AND 鋼鐵領域 CPC。
     if is_steel_domain and target_hits:
-        if core_target_hits:
-            cpc_strength = "core"
-        elif support_target_hits:
-            cpc_strength = "support"
-        else:
-            cpc_strength = "none"
-        strength_counts[cpc_strength] += 1
-
         output_record = dict(record)
         output_record["priority_year"] = extract_priority_year(record)
         output_record["domain_matched_prefixes"] = domain_hits
         output_record["target_matched_prefixes"] = target_hits
-        output_record["core_target_matched_prefixes"] = core_target_hits
-        output_record["support_target_matched_prefixes"] = support_target_hits
-        output_record["cpc_strength"] = cpc_strength
 
         output_record["domain_source"] = "cpc_domain"
 
         filtered.append(output_record)
+
+        # 統計最終輸出資料中，第二群組每個 CPC 前綴命中的筆數
+        # 注意：target_hits 是 set 去重後的結果，因此同一筆專利命中同一前綴只會算 1 次
+        filtered_target_prefix_counter.update(target_hits)
 
 
 # 輸出符合條件的資料。
@@ -278,7 +287,7 @@ for record in filtered:
         year_distribution[year] = year_distribution.get(year, 0) + 1
 
 print()
-print("=== 鋼鐵場域 AND 減碳/能源/資源循環 CPC 候選池結果 ===")
+print("=== 鋼鐵場域 AND 減碳目標 CPC 篩選結果 ===")
 print(f"輸入總筆數:{total_input:,}")
 print()
 print(f"[步驟一] 時間過濾:priority_date 年份 ∈ [{PRIORITY_YEAR_MIN}, {PRIORITY_YEAR_MAX}]")
@@ -288,17 +297,18 @@ print(f"  剔除(年份在區間外):{year_out_of_range:,}")
 print()
 print("[步驟二] 各條件命中筆數(以時間過濾後母體計算,彼此可能重複)")
 print(f"  命中鋼鐵領域 CPC (C21B/C21C):{domain_hit_count:,}")
-print(f"  命中目標 CPC:{target_hit_count:,}")
-print(f"  命中核心目標 CPC:{core_target_hit_count:,}")
-print(f"  命中輔助目標 CPC:{support_target_hit_count:,}")
+print(f"  命中減碳目標 CPC:{target_hit_count:,}")
 print()
 print("[鋼鐵場域條件]")
 print(f"  鋼鐵領域 CPC:{steel_domain_cpc_count:,}")
 print()
 print("[最終輸出]")
-print(f"  目標 CPC AND 鋼鐵領域 CPC AND 年份範圍候選池:{len(filtered):,}")
-print(f"  CPC 強度 core:{strength_counts['core']:,}")
-print(f"  CPC 強度 support:{strength_counts['support']:,}")
+print(f"  減碳目標 CPC AND 鋼鐵領域 CPC AND 年份範圍:{len(filtered):,}")
+print()
+print("[第二群組 Target CPC 前綴命中統計：以最終輸出 filtered 計算]")
+for prefix in TARGET_PREFIXES:
+    print(f"  {prefix}: {filtered_target_prefix_counter.get(prefix, 0):,}")
+
 if year_distribution:
     print(f"  年份分布:")
     for year in sorted(year_distribution):

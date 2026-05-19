@@ -48,7 +48,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_DIR / "output_specter2_3000"
 EMBEDDING_CACHE = OUTPUT_DIR / "specter2_embeddings.npy"
 EMBEDDING_INDEX = OUTPUT_DIR / "specter2_embeddings_index.parquet"
-EMBEDDING_INPUT_MODE = "title_title_abstract"
+EMBEDDING_INPUT_MODE = "abstract_only"
 
 
 # =============================================================================
@@ -228,18 +228,12 @@ def stage1_load_and_preprocess(input_path: str):
     df = df[df["time_segment"] != "OUT_OF_RANGE"].reset_index(drop=True)
 
     # ── 1.7 建立 BERTopic 與 SPECTER2 的輸入文本 ──────────────────────────
-    # Title 重複一次以提高短標題中技術詞的權重,同時保留 abstract 完整上下文。
-    # CountVectorizer 會在 Stage 5 自行做小寫化 + 停用詞過濾。
-    df["model_text"] = (
-        df["title_clean"].fillna("").astype(str).str.strip()
-        + ". "
-        + df["title_clean"].fillna("").astype(str).str.strip()
-        + ". "
-        + df["abstract_clean"].fillna("").astype(str).str.strip()
-    ).str.strip()
+    # BERTopic 文件輸入:用物理清洗後的 abstract(保留完整句型)
+    # CountVectorizer 會在 Stage 5 自行做小寫化 + 停用詞過濾
+    abstracts = df["abstract_clean"].tolist()
 
-    abstracts = df["model_text"].tolist()
-    embedding_texts = df["model_text"].tolist()
+    # SPECTER2 嵌入輸入:僅使用 abstract
+    embedding_texts = df["abstract_clean"].astype(str).str.strip().tolist()
 
     print("\n各時間區段樣本數:")
     print(df["time_segment"].value_counts().sort_index().to_string())
@@ -394,13 +388,13 @@ def stage4_hdbscan() -> HDBSCAN:
     print("STAGE 4:HDBSCAN 聚類設定")
     print("=" * 60)
     hdbscan_model = HDBSCAN(
-        min_cluster_size=15,
-        min_samples=8,
+        min_cluster_size=10,
+        min_samples=3,
         metric="euclidean",
         cluster_selection_method="eom",
         prediction_data=True,
     )
-    print("HDBSCAN:min_cluster_size=15 | min_samples=8 | eom\n")
+    print("HDBSCAN:min_cluster_size=10 | min_samples=3 | eom\n")
     return hdbscan_model
 
 
@@ -528,7 +522,7 @@ def build_representation_model(
 def stage6_train_and_refine(
     abstracts, df, embedding_model, embeddings,
     umap_model, hdbscan_model, vectorizer_model, ctfidf_model,
-    target_topics: int | None = None,
+    target_topics: int = 50,
     apply_outlier_reduction: bool = False,
 ):
     """
@@ -576,11 +570,9 @@ def stage6_train_and_refine(
     if apply_outlier_reduction and noise_before:
         print(f"執行 reduce_outliers,目前雜訊:{noise_before:,}")
         new_topics = topic_model.reduce_outliers(
-            abstracts,
-            topic_model.topics_,
-            strategy="embeddings",
-            embeddings=embeddings,
-            threshold=0.10,
+            abstracts, topic_model.topics_,
+            strategy="c-tf-idf",
+            threshold=0.09,
         )
         topic_model.topics_ = new_topics
 
@@ -813,7 +805,7 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 
 if __name__ == "__main__":
     INPUT_PATH = str(PROJECT_DIR / "data_globalmorecpc" / "global_onlycpc_carbon_neutral_v2.json")
-    TARGET_TOPICS = None
+    TARGET_TOPICS = 70
 
     # STAGE 1:資料載入 + 物理清洗
     df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)
@@ -839,7 +831,7 @@ if __name__ == "__main__":
         umap_model, hdbscan_model,
         vectorizer_model, ctfidf_model,
         target_topics=TARGET_TOPICS,
-        apply_outlier_reduction=False,
+        apply_outlier_reduction=True,
     )
 
     # STAGE 7:Topics over Time
