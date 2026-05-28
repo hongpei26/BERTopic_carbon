@@ -16,6 +16,22 @@ from pathlib import Path
 src_dir = Path("/home/carbon/carbon/data_global_v2/Carbon_onlycpc_global_morecpc_v2")
 out = Path("/home/carbon/carbon/data_global_v2/Carbon_onlycpc_global_morecpc_v2/global_application_dedup.json")
 
+PREFERRED_OUTPUT_COLUMNS = [
+    "publication_number",
+    "application_number",
+    "family_id",
+    "country_code",
+    "kind_code",
+    "publication_date",
+    "filing_date",
+    "priority_date",
+    "title_en",
+    "abstract_en",
+    "matched_cpc_codes",
+    "all_cpc_codes",
+    "all_ipc_codes",
+]
+
 # 收集來源資料夾中的所有 Parquet 檔，排序後讀取可讓結果更穩定可重現。
 parquet_files = sorted(src_dir.glob("*.parquet"))
 if not parquet_files:
@@ -62,6 +78,17 @@ dedup = (
     )
     .reset_index(drop=True)
 )
+
+missing_preferred = [c for c in PREFERRED_OUTPUT_COLUMNS if c not in dedup.columns]
+if missing_preferred:
+    print(f"warning_missing_preferred_columns {missing_preferred}")
+
+ordered_columns = [
+    c for c in PREFERRED_OUTPUT_COLUMNS if c in dedup.columns
+] + [
+    c for c in dedup.columns if c not in PREFERRED_OUTPUT_COLUMNS
+]
+dedup = dedup[ordered_columns]
 
 
 def clean_json_value(value):

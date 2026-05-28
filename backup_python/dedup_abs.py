@@ -2,26 +2,42 @@ import json
 from pathlib import Path
 
 # =============================================================================
-# 依 abstract_en 對專利資料做第二階段去重
+# 第三階段：依 abstract_en 對專利資料做最後去重
 #
 # 使用情境：
-# 前一步已經用 application_number 去重，這支腳本再處理「不同申請號但摘要相同」
-# 的重複資料，避免同一段英文摘要在語料中重複出現，影響後續 BERTopic 主題建模。
+# 前一步已經用 family_id 去重，這支腳本做最後掃蕩，處理「不同專利家族但摘要完全相同」
+# 的極端重複資料，避免同一段英文摘要在語料中重複出現，影響後續 BERTopic 主題建模。
 #
 # 去重邏輯：
-# 1. 讀取 global_application_dedup.json。
+# 1. 讀取 global_family_dedup.json。
 # 2. 移除 abstract_en 為 null 或空字串的紀錄。
 # 3. 以完整 abstract_en 文字作為 key。
 # 4. 若多筆資料摘要完全相同，保留日期最早的一筆：
 #    priority_date → filing_date → publication_date。
 # 5. 若日期仍相同，保留原始讀入順序最前的紀錄作為 tie-breaker。
-# 6. 輸出 global_abstract_dedup.json。
+# 6. 輸出 global_abstract_dedup.json (供給後續模型使用)。
 # =============================================================================
 
-# 輸入資料：前一步 application_number 去重後的 JSON
-src = Path("/home/carbon/carbon/data_global_v2/Carbon_onlycpc_global_morecpc_v2/global_application_dedup.json")
+# 輸入資料：前一步 family_id 去重後的 JSON
+src = Path("/home/carbon/carbon/data_global_v2/Carbon_onlycpc_global_morecpc_v2/global_family_dedup.json")
 # 輸出資料：再依摘要去重後的 JSON
 out = Path("/home/carbon/carbon/data_global_v2/Carbon_onlycpc_global_morecpc_v2/global_abstract_dedup.json")
+
+PREFERRED_OUTPUT_COLUMNS = [
+    "publication_number",
+    "application_number",
+    "family_id",
+    "country_code",
+    "kind_code",
+    "publication_date",
+    "filing_date",
+    "priority_date",
+    "title_en",
+    "abstract_en",
+    "matched_cpc_codes",
+    "all_cpc_codes",
+    "all_ipc_codes",
+]
 
 
 def date_sort_value(value):
@@ -81,9 +97,28 @@ for record in deduped:
     del record["_original_order"]
 
 
+missing_preferred = [
+    column for column in PREFERRED_OUTPUT_COLUMNS
+    if not any(column in record for record in deduped)
+]
+if missing_preferred:
+    print(f"warning_missing_preferred_columns {missing_preferred}")
+
+ordered_deduped = []
+for record in deduped:
+    ordered_record = {}
+    for column in PREFERRED_OUTPUT_COLUMNS:
+        if column in record:
+            ordered_record[column] = record[column]
+    for key, value in record.items():
+        if key not in ordered_record:
+            ordered_record[key] = value
+    ordered_deduped.append(ordered_record)
+
+
 # 輸出去重結果；allow_nan=False 確保輸出符合標準 JSON，不允許 NaN / Infinity。
 out.write_text(
-    json.dumps(deduped, ensure_ascii=False, indent=2, allow_nan=False),
+    json.dumps(ordered_deduped, ensure_ascii=False, indent=2, allow_nan=False),
     encoding="utf-8",
 )
 

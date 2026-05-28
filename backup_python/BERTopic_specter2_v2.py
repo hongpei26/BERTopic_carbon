@@ -1,13 +1,12 @@
 # =============================================================================
-# 碳捕捉專利 BERTopic 動態主題建模 Pipeline v2(對齊方法論)
+# 碳捕捉專利 BERTopic 動態主題建模 Pipeline v3(多主題軟分配版)
 # Stage 1–7:資料載入 → SPECTER2 → UMAP → HDBSCAN → c-TF-IDF
-#           → KeyBERT+MMR+LLM 表示法微調 → TOT
+#           → KeyBERT+MMR+LLM 表示法微調 → 多主題軟分配 → TOT(多主題)
 # -----------------------------------------------------------------------------
-# 主要調整(對齊方法論):
-#  Stage 1:只做物理清洗,保留標點、停用詞、大小寫,供 Transformer 完整理解語意
-#  Stage 2:加入 embedding 快取(.npy),避免反覆計算
-#  Stage 5:停用詞與小寫化的「真正落腳點」,只影響 c-TF-IDF 關鍵字展示
-#  Stage 6:加入 KeyBERTInspired → MMR → OpenAI GPT-4o-mini 英文標籤微調流水線
+# v3 新增(對齊方法論):
+#  Stage 6:calculate_probabilities=True
+#  Stage 6.5:approximate_distribution → 軟分配矩陣 → 多標籤展開
+#  Stage 7:支援 explode(multi_topic_ids) 模式,輸出 *_multi.csv 系列
 # =============================================================================
 
 # ── 安裝套件(首次執行時取消註解)──────────────────────────────────────────
@@ -47,8 +46,8 @@ warnings.filterwarnings("ignore")
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 # 使用 weighted_related_patents.json 後的新輸出資料夾
-OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_robust"
-# OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_main"
+# OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_robust"
+OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_main"
 
 EMBEDDING_CACHE = OUTPUT_DIR / "specter2_embeddings.npy"
 EMBEDDING_INDEX = OUTPUT_DIR / "specter2_embeddings_index.parquet"
@@ -576,7 +575,7 @@ def build_representation_model(
             client = openai.OpenAI(api_key=openai_key)
             english_label = OpenAIRepresentation(
                 client=client,
-                model="gpt-4o-mini",      
+                model="gpt-4o-mini",
                 chat=True,
                 prompt=LLM_LABEL_PROMPT,
                 nr_docs=6,                # 餵 6 篇最具代表性的摘要
@@ -602,6 +601,11 @@ def stage6_train_and_refine(
 ):
     """
     BERTopic 訓練 + 表示法多層級微調 + Topic ID 回填
+
+    v3 變更:calculate_probabilities=True,讓 HDBSCAN 同時輸出 soft probabilities
+            (注意:後續真正用於多主題判定的是 Stage 6.5 的
+             approximate_distribution,此處的 probs 主要是讓 BERTopic 進入
+             機率感知模式,便於下游 API 一致性。)
     """
 
     print("=" * 60)
@@ -628,7 +632,7 @@ def stage6_train_and_refine(
         representation_model=keyword_representation_model,
         nr_topics=target_topics,
         top_n_words=10,
-        calculate_probabilities=False,  # 提速;若需 probs 再開啟
+        calculate_probabilities=True,   # ★ v3:開啟機率計算
         verbose=True,
     )
 
@@ -738,7 +742,166 @@ def stage6_train_and_refine(
 
 
 # =============================================================================
-# STAGE 7:Topics over Time(與 v1 相同邏輯)
+# STAGE 6.5:多主題軟分配 (Approximate Distribution → 多標籤展開)
+# =============================================================================
+
+def stage6_5_multi_topic_assignment(
+    topic_model,
+    df: pd.DataFrame,
+    abstracts: list,
+    threshold: float = 0.20,
+    window: int = 8,
+    stride: int = 4,
+    use_embedding_model: bool = False,
+    batch_size: int = 500,
+):
+    """
+    對應方法論四步驟:
+      步驟 1:calculate_probabilities=True (已在 Stage 6 啟用)
+      步驟 2:approximate_distribution() → (n_docs × n_topics) 軟分配矩陣
+      步驟 3:依 threshold 過濾 → multi_topic_ids
+      步驟 4:準備供 Stage 7 explode 使用
+
+    參數說明:
+      threshold              : 主題機率門檻 (預設 0.20)
+      window, stride         : token 視窗大小與步長,小視窗較細緻、計算較慢
+      use_embedding_model    : True = 每個 window 重新用 SPECTER2 嵌入(慢、精)
+                                False = 用 c-TF-IDF (快、足夠用於專利長度)
+      batch_size             : 文件批次大小
+    """
+    print("=" * 60)
+    print(f"STAGE 6.5:多主題軟分配 (threshold={threshold:.2f})")
+    print("=" * 60)
+
+    # ── 步驟 2:計算 token-level 軟分配矩陣 ──────────────────────────────
+    print(f"執行 approximate_distribution"
+          f"(window={window}, stride={stride}, "
+          f"use_embedding_model={use_embedding_model})...")
+
+    topic_distr, _ = topic_model.approximate_distribution(
+        abstracts,
+        window=window,
+        stride=stride,
+        use_embedding_model=use_embedding_model,
+        calculate_tokens=False,
+        separator=" ",
+        batch_size=batch_size,
+        padding=False,
+    )
+    print(f"分佈矩陣 shape:{topic_distr.shape} "
+          f"(n_docs={topic_distr.shape[0]:,}, n_topics={topic_distr.shape[1]})")
+
+    # topic_distr 的欄位順序對應有效主題(排除 -1),按 topic_id 升序排列
+    valid_topic_ids = sorted(t for t in set(topic_model.topics_) if t != -1)
+    if len(valid_topic_ids) != topic_distr.shape[1]:
+        raise RuntimeError(
+            f"主題數對不上:valid={len(valid_topic_ids)} vs "
+            f"matrix_cols={topic_distr.shape[1]}"
+        )
+
+    # ── 步驟 3:依門檻產生多主題標籤 ─────────────────────────────────────
+    multi_topic_ids_list = []
+    multi_topic_probs_list = []
+    hard_topics = list(topic_model.topics_)
+
+    for i in range(topic_distr.shape[0]):
+        probs = topic_distr[i]
+        # 取出機率 ≥ threshold 的主題,並依機率由高至低排序
+        above = [
+            (tid, float(p))
+            for tid, p in zip(valid_topic_ids, probs)
+            if p >= threshold
+        ]
+        above.sort(key=lambda x: -x[1])
+
+        if above:
+            multi_topic_ids_list.append([tid for tid, _ in above])
+            multi_topic_probs_list.append([round(p, 4) for _, p in above])
+        else:
+            # 沒有任何主題超過門檻 → 用 hard assignment 兜底
+            hard_tid = hard_topics[i]
+            if hard_tid != -1:
+                idx = valid_topic_ids.index(hard_tid)
+                multi_topic_ids_list.append([hard_tid])
+                multi_topic_probs_list.append([round(float(probs[idx]), 4)])
+            else:
+                multi_topic_ids_list.append([])
+                multi_topic_probs_list.append([])
+
+    df = df.copy()
+    df["multi_topic_ids"] = multi_topic_ids_list
+    df["multi_topic_probs"] = multi_topic_probs_list
+    df["multi_topic_count"] = df["multi_topic_ids"].apply(len)
+    df["is_cross_domain"] = df["multi_topic_count"] >= 2
+    df["primary_topic_id"] = df["multi_topic_ids"].apply(
+        lambda x: x[0] if x else -1
+    )
+
+    # ── 統計報告 ──────────────────────────────────────────────────────────
+    n_total = len(df)
+    n_multi = int((df["multi_topic_count"] >= 2).sum())
+    n_single = int((df["multi_topic_count"] == 1).sum())
+    n_empty = int((df["multi_topic_count"] == 0).sum())
+
+    print(f"\n多主題分配統計:")
+    print(f"  跨主題 (≥2):  {n_multi:>6,} ({n_multi / n_total:.1%})")
+    print(f"  單主題 (=1):  {n_single:>6,} ({n_single / n_total:.1%})")
+    print(f"  無主題 (=0):  {n_empty:>6,} ({n_empty / n_total:.1%})")
+
+    # ── 雜訊分析 (無任何主題) ──────────────────────────────────────────────────
+    if n_empty > 0:
+        df_unknown = df[df["multi_topic_count"] == 0]
+        print(f"\n[雜訊分析] 完全無主題的專利抽樣 (共 {len(df_unknown)} 筆):")
+        # 抽樣看 abstract
+        sample_size = min(20, len(df_unknown))
+        for _, row in df_unknown.sample(sample_size, random_state=42).iterrows():
+            print(f"\n--- {row['application_number']} ---")
+            print(f"Title: {row.get('title_clean', '')[:120]}")
+            print(f"Abstract: {row.get('abstract_clean', '')[:300]}...")
+
+        # 看看這些雜訊命中的關鍵字類別,推測它們屬於哪個漏掉的子領域
+        if "decarbon_hits" in df_unknown.columns:
+            from collections import Counter
+            all_hits = []
+            for hits in df_unknown["decarbon_hits"].dropna():
+                if isinstance(hits, (list, tuple)):
+                    all_hits.extend(hits)
+                elif isinstance(hits, str):
+                    try:
+                        import ast
+                        h_list = ast.literal_eval(hits)
+                        if isinstance(h_list, (list, tuple)):
+                            all_hits.extend(h_list)
+                        else:
+                            all_hits.append(hits)
+                    except Exception:
+                        all_hits.append(hits)
+            print("\n雜訊中 decarbon 關鍵字命中 Top 20:")
+            print(Counter(all_hits).most_common(20))
+
+    if n_multi > 0:
+        df_multi = df[df["multi_topic_count"] >= 2].copy()
+        df_multi["topic_combo"] = df_multi["multi_topic_ids"].apply(
+            lambda x: " + ".join(map(str, sorted(x)))
+        )
+        top_combos = df_multi["topic_combo"].value_counts().head(10)
+        print(f"\nTop 10 跨主題組合(Topic_ID):")
+        for combo, cnt in top_combos.items():
+            print(f"  {combo:<35} {cnt:>5} 筆")
+
+    # ── 儲存 ──────────────────────────────────────────────────────────────
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(OUTPUT_DIR / "patent_with_multi_topics.parquet", index=False)
+    np.save(OUTPUT_DIR / "topic_distribution_matrix.npy", topic_distr)
+    print(f"\n已儲存:patent_with_multi_topics.parquet")
+    print(f"已儲存:topic_distribution_matrix.npy (shape={topic_distr.shape})")
+    print(f"\nSTAGE 6.5 完成\n")
+
+    return df, topic_distr
+
+
+# =============================================================================
+# STAGE 7 輔助函式:軌跡分類
 # =============================================================================
 
 def classify_trajectory(freq, shares):
@@ -762,9 +925,27 @@ def classify_trajectory(freq, shares):
     return "相對穩定"
 
 
-def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
+# =============================================================================
+# STAGE 7:Topics over Time(支援多主題 explode)
+# =============================================================================
+
+def stage7_topics_over_time(
+    topic_model, df, abstracts, keywords_df,
+    use_multi_topic: bool = True,
+):
+    """
+    v3 變更:
+      - 若 df 中有 multi_topic_ids,預設改用 explode 模式
+      - explode 後,跨主題專利會同時計入多個 topic_id 的統計
+      - 多主題輸出檔名加 _multi 後綴,與原 hard assignment 並存
+    """
     print("=" * 60)
-    print("STAGE 7:Topics over Time 動態分析")
+    mode_str = (
+        "多主題 explode 模式"
+        if use_multi_topic and "multi_topic_ids" in df.columns
+        else "單主題硬分配模式"
+    )
+    print(f"STAGE 7:Topics over Time 動態分析({mode_str})")
     print("=" * 60)
 
     SEGMENTS = [
@@ -774,8 +955,8 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
     segment_to_code = {s: i for i, s in enumerate(SEGMENTS)}
     code_to_segment = {i: s for s, i in segment_to_code.items()}
 
+    # ── BERTopic 內建 TOT(hard assignment,用於官方視覺化)────────────
     timestamps = df["time_segment"].map(segment_to_code).tolist()
-
     tot = topic_model.topics_over_time(
         abstracts, timestamps,
         nr_bins=None,
@@ -785,17 +966,56 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
     tot["Timestamp"] = tot["Timestamp"].map(code_to_segment)
     tot.to_csv(OUTPUT_DIR / "topics_over_time.csv",
                index=False, encoding="utf-8-sig")
-    print("TOT 已儲存:topics_over_time.csv")
+    print("BERTopic 內建 TOT 已儲存:topics_over_time.csv(hard assignment)")
+
+    # ── 步驟 4:explode multi_topic_ids,讓跨域專利同時計入多個主題 ──
+    if use_multi_topic and "multi_topic_ids" in df.columns:
+        df_for_stats = df[df["multi_topic_count"] > 0].copy()
+        df_for_stats = df_for_stats.explode("multi_topic_ids")
+        # 重要:explode 後 index 會重複(同一筆被展開成多列),
+        # 必須 reset_index 否則後面的 pd.crosstab 會 raise
+        # ValueError: cannot reindex on an axis with duplicate labels
+        df_for_stats = df_for_stats.reset_index(drop=True)
+        df_for_stats = df_for_stats.rename(
+            columns={"multi_topic_ids": "topic_for_stats"}
+        )
+        df_for_stats["topic_for_stats"] = df_for_stats["topic_for_stats"].astype(int)
+        suffix = "_multi"
+        n_explode = len(df_for_stats)
+        n_origin = int((df["multi_topic_count"] > 0).sum())
+        print(f"explode 後資料筆數:{n_explode:,} "
+              f"(原 {n_origin:,} 篇有主題的專利)")
+    else:
+        df_for_stats = df[df["topic_id"] != -1].copy()
+        df_for_stats = df_for_stats.reset_index(drop=True)
+        df_for_stats = df_for_stats.rename(
+            columns={"topic_id": "topic_for_stats"}
+        )
+        suffix = ""
+
+    df_for_stats["priority_year"] = df_for_stats["priority_date"].dt.year
+
+    label_map = dict(zip(keywords_df["Topic_ID"], keywords_df["English_Label"]))
+    keyword_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Top10_Keywords"]))
+    count_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Doc_Count"]))
+    midpoints = np.array([2008, 2013, 2018, 2023], dtype=float)
+
+    # ── 分段次數矩陣 ──────────────────────────────────────────────────────
+    segment_counts = pd.crosstab(
+        df_for_stats["topic_for_stats"],
+        df_for_stats["time_segment"]
+    )
+    segment_counts = segment_counts.reindex(columns=SEGMENTS, fill_value=0)
+    segment_counts.to_csv(
+        OUTPUT_DIR / f"topic_segment_counts{suffix}.csv",
+        encoding="utf-8-sig"
+    )
 
     # ── 生命週期 ──────────────────────────────────────────────────────────
-    label_map = dict(zip(keywords_df["Topic_ID"], keywords_df["English_Label"]))
     lifecycle_rows = []
-    for tid in sorted(tot["Topic"].unique()):
-        if tid == -1:
-            continue
-        subset = tot[tot["Topic"] == tid]
-        freq_map = dict(zip(subset["Timestamp"], subset["Frequency"]))
-        freq = [freq_map.get(s, 0) for s in SEGMENTS]
+    print("\n各主題生命週期:")
+    for tid in sorted(segment_counts.index):
+        freq = [int(segment_counts.loc[tid, s]) for s in SEGMENTS]
         early, late = sum(freq[:2]), sum(freq[2:])
         growth = (late - early) / (early + 1)
         if growth > 0.5 and freq[0] < freq[-1]:
@@ -813,39 +1033,43 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
             "Status": status,
         })
         print(f"Topic {tid:>3} | A:{freq[0]:>4} B:{freq[1]:>4} "
-              f"C:{freq[2]:>4} D:{freq[3]:>4} | 成長:{growth:>+6.2f} | {status}")
+              f"C:{freq[2]:>4} D:{freq[3]:>4} | "
+              f"成長:{growth:>+6.2f} | {status}")
     lifecycle_df = pd.DataFrame(lifecycle_rows)
-    lifecycle_df.to_csv(OUTPUT_DIR / "topic_lifecycle.csv",
-                        index=False, encoding="utf-8-sig")
+    lifecycle_df.to_csv(
+        OUTPUT_DIR / f"topic_lifecycle{suffix}.csv",
+        index=False, encoding="utf-8-sig"
+    )
 
-    # ── 演進軌跡 ──────────────────────────────────────────────────────────
-    topic_df = df[df["topic_id"] != -1].copy()
-    topic_df["priority_year"] = topic_df["priority_date"].dt.year
-
-    yearly_counts = pd.crosstab(topic_df["priority_year"], topic_df["topic_id"])
+    # ── 年度次數與占比 ────────────────────────────────────────────────────
+    yearly_counts = pd.crosstab(
+        df_for_stats["priority_year"], df_for_stats["topic_for_stats"]
+    )
     yearly_counts = yearly_counts.reindex(range(2006, 2026), fill_value=0)
-    yearly_counts.to_csv(OUTPUT_DIR / "topic_yearly_counts.csv",
-                         encoding="utf-8-sig")
+    yearly_counts.to_csv(
+        OUTPUT_DIR / f"topic_yearly_counts{suffix}.csv",
+        encoding="utf-8-sig"
+    )
 
     yearly_totals = yearly_counts.sum(axis=1).replace(0, np.nan)
     yearly_shares = yearly_counts.div(yearly_totals, axis=0).fillna(0)
-    yearly_shares.to_csv(OUTPUT_DIR / "topic_yearly_shares.csv",
-                         encoding="utf-8-sig")
+    yearly_shares.to_csv(
+        OUTPUT_DIR / f"topic_yearly_shares{suffix}.csv",
+        encoding="utf-8-sig"
+    )
 
-    segment_counts = pd.crosstab(topic_df["topic_id"], topic_df["time_segment"])
-    segment_counts = segment_counts.reindex(columns=SEGMENTS, fill_value=0)
-    segment_counts.to_csv(OUTPUT_DIR / "topic_segment_counts.csv",
-                          encoding="utf-8-sig")
+    segment_totals = (
+        df_for_stats["time_segment"].value_counts().reindex(SEGMENTS, fill_value=0)
+    )
+    segment_shares = segment_counts.div(
+        segment_totals.replace(0, np.nan), axis=1
+    ).fillna(0)
+    segment_shares.to_csv(
+        OUTPUT_DIR / f"topic_segment_shares{suffix}.csv",
+        encoding="utf-8-sig"
+    )
 
-    segment_totals = topic_df["time_segment"].value_counts().reindex(SEGMENTS, fill_value=0)
-    segment_shares = segment_counts.div(segment_totals.replace(0, np.nan), axis=1).fillna(0)
-    segment_shares.to_csv(OUTPUT_DIR / "topic_segment_shares.csv",
-                          encoding="utf-8-sig")
-
-    keyword_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Top10_Keywords"]))
-    count_map = dict(zip(keywords_df["Topic_ID"], keywords_df["Doc_Count"]))
-    midpoints = np.array([2008, 2013, 2018, 2023], dtype=float)
-
+    # ── 演進軌跡 ──────────────────────────────────────────────────────────
     evolution_rows = []
     for tid in sorted(segment_counts.index):
         freq = [int(segment_counts.loc[tid, s]) for s in SEGMENTS]
@@ -869,8 +1093,10 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
             "Trajectory": classify_trajectory(freq, shares),
         })
     evolution_df = pd.DataFrame(evolution_rows)
-    evolution_df.to_csv(OUTPUT_DIR / "topic_evolution_summary.csv",
-                        index=False, encoding="utf-8-sig")
+    evolution_df.to_csv(
+        OUTPUT_DIR / f"topic_evolution_summary{suffix}.csv",
+        index=False, encoding="utf-8-sig"
+    )
 
     print(f"\nSTAGE 7 完成\n")
     return tot, lifecycle_df, evolution_df
@@ -883,8 +1109,8 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 if __name__ == "__main__":
     # main：只使用 final_label == related
     # robust：使用 related + weak_related + weak_related_audit
-    SAMPLE_MODE = "robust"
-    # SAMPLE_MODE = "main"
+    # SAMPLE_MODE = "robust"
+    SAMPLE_MODE = "main"
 
     INPUT_PATH = (
         "/home/carbon/carbon/data_global_v2/"
@@ -894,6 +1120,7 @@ if __name__ == "__main__":
     )
 
     TARGET_TOPICS = None
+    PROB_THRESHOLD = 0.20   # ★ v3:多主題判定門檻
 
     # STAGE 1:資料載入 + 物理清洗
     df, abstracts, embedding_texts = stage1_load_and_preprocess(
@@ -915,7 +1142,7 @@ if __name__ == "__main__":
     # STAGE 5:c-TF-IDF
     vectorizer_model, ctfidf_model = stage5_vectorizer()
 
-    # STAGE 6:訓練 + 表示法多層級微調
+    # STAGE 6:訓練 + 表示法多層級微調 (calculate_probabilities=True)
     topic_model, df, keywords_df = stage6_train_and_refine(
         abstracts, df,
         embedding_model, embeddings,
@@ -925,20 +1152,35 @@ if __name__ == "__main__":
         apply_outlier_reduction=False,
     )
 
-    # STAGE 7:Topics over Time
+    # ★ STAGE 6.5:多主題軟分配(approximate_distribution)
+    df, topic_distr = stage6_5_multi_topic_assignment(
+        topic_model, df, abstracts,
+        threshold=PROB_THRESHOLD,
+        window=8, stride=4,
+        use_embedding_model=False,   # 用 c-TF-IDF,夠快夠準
+        batch_size=500,
+    )
+
+    # STAGE 7:Topics over Time(預設開啟多主題 explode 模式)
     tot_df, lifecycle_df, evolution_df = stage7_topics_over_time(
-        topic_model, df, abstracts, keywords_df
+        topic_model, df, abstracts, keywords_df,
+        use_multi_topic=True,
     )
 
     print("=" * 60)
     print("全流程執行完畢")
     print(f"輸出目錄:{OUTPUT_DIR}")
-    print("  ├── specter2_embeddings.npy(嵌入快取)")
-    print("  ├── patent_with_topics.parquet")
-    print("  ├── topic_keywords.csv(含 English_Label 欄)")
-    print("  ├── topics_over_time.csv")
-    print("  ├── topic_lifecycle.csv")
-    print("  ├── topic_evolution_summary.csv")
-    print("  ├── topic_yearly_counts.csv / topic_yearly_shares.csv")
-    print("  └── bertopic_model/(模型 safetensors)")
+    print("  ├── specter2_embeddings.npy            (SPECTER2 嵌入快取)")
+    print("  ├── patent_with_topics.parquet         (硬分配:topic_id)")
+    print("  ├── patent_with_multi_topics.parquet   (軟分配:multi_topic_ids/probs)")
+    print("  ├── topic_distribution_matrix.npy      (n_docs × n_topics 機率矩陣)")
+    print("  ├── topic_keywords.csv                 (含 English_Label 欄)")
+    print("  ├── topics_over_time.csv               (BERTopic 內建 TOT, hard)")
+    print("  ├── topic_lifecycle_multi.csv          (多主題生命週期)")
+    print("  ├── topic_evolution_summary_multi.csv  (多主題演進軌跡)")
+    print("  ├── topic_segment_counts_multi.csv     (多主題分段次數)")
+    print("  ├── topic_segment_shares_multi.csv     (多主題分段占比)")
+    print("  ├── topic_yearly_counts_multi.csv      (多主題年度次數)")
+    print("  ├── topic_yearly_shares_multi.csv      (多主題年度占比)")
+    print("  └── bertopic_model/                    (BERTopic 模型 safetensors)")
     print("=" * 60)

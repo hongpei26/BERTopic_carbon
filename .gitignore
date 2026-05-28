@@ -18,3 +18,6 @@ scratch*.py
 data_globalmorecpc/
 data_global_v2/
 *.txt
+steel_carbonneutral_FINAL.csv
+scratch_noise.log
+sample_review_main_vs_robust/

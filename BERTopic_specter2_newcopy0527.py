@@ -44,12 +44,8 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 
 warnings.filterwarnings("ignore")
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-
-# 使用 weighted_related_patents.json 後的新輸出資料夾
-OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_robust"
-# OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_main"
-
+PROJECT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = PROJECT_DIR / "output_specter2_3000"
 EMBEDDING_CACHE = OUTPUT_DIR / "specter2_embeddings.npy"
 EMBEDDING_INDEX = OUTPUT_DIR / "specter2_embeddings_index.parquet"
 EMBEDDING_INPUT_MODE = "title_title_abstract"
@@ -135,7 +131,7 @@ CUSTOM_STOPWORDS = sorted(
 # STAGE 1:資料載入與「物理清洗」(對齊方法論:不做語意閹割)
 # =============================================================================
 
-def stage1_load_and_preprocess(input_path: str, sample_mode: str = "robust"):
+def stage1_load_and_preprocess(input_path: str):
     """
     讀取 JSON / Parquet,僅做物理清洗:
       - HTML entity 解碼
@@ -165,33 +161,6 @@ def stage1_load_and_preprocess(input_path: str, sample_mode: str = "robust"):
         )
     print(f"原始資料筆數:{len(df):,}")
 
-    # ── 1.1.1 依 final_label 選擇樣本口徑 ─────────────────────────────
-    if "final_label" in df.columns:
-        before = len(df)
-
-        if sample_mode == "main":
-            df = df[df["final_label"] == "related"].copy()
-            print(
-                f"樣本模式 main：只保留 related，"
-                f"移除 {before - len(df):,} 筆 → 剩餘 {len(df):,} 筆"
-            )
-
-        elif sample_mode == "robust":
-            df = df[df["final_label"].isin([
-                "related",
-                "weak_related",
-                "weak_related_audit",
-            ])].copy()
-            print(
-                f"樣本模式 robust：保留 related + weak_related + weak_related_audit，"
-                f"移除 {before - len(df):,} 筆 → 剩餘 {len(df):,} 筆"
-            )
-
-        else:
-            raise ValueError("sample_mode must be 'main' or 'robust'")
-    else:
-        print("未偵測到 final_label 欄位，將使用全部資料。")
-
     # ── 1.2 保留核心欄位 ──────────────────────────────────────────────────
     required_cols = ["application_number", "priority_date", "abstract_en"]
     missing = [c for c in required_cols if c not in df.columns]
@@ -199,46 +168,8 @@ def stage1_load_and_preprocess(input_path: str, sample_mode: str = "robust"):
         raise ValueError(f"缺少必要欄位:{missing}")
 
     optional_cols = [
-        "publication_number",
-        "title_en",
-
-        # 前面加權篩選結果
-        "final_label",
-        "relevance_label",
-        "relevance_rule",
-        "total_score",
-        "cpc_score",
-        "high_score",
-        "decarbon_score",
-        "steel_score",
-        "action_score",
-        "noise_penalty",
-        "adjusted_noise_penalty",
-        "noise_adjusted",
-        "has_decarbon_context",
-        "cpc_strength",
-
-        # CPC 與關鍵字命中
-        "matched_cpc_codes",
-        "core_cpc_hits",
-        "support_cpc_hits",
-        "peripheral_cpc_hits",
-        "high_hits",
-        "decarbon_hits",
-        "steel_hits",
-        "action_hits",
-        "noise_hits",
-        "audit_high_confidence",
-        "audit_categories",
-        "audit_hits",
-
-        # 原本 CPC 篩選來源欄位
-        "domain_matched_prefixes",
-        "target_matched_prefixes",
-        "domain_source",
-        "all_cpc_codes",
-        "all_ipc_codes",
-        "priority_year",
+        "publication_number", "title_en",
+        "matched_cpc_codes", "domain_matched_prefixes", "target_matched_prefixes",
     ]
     keep_cols = required_cols + [c for c in optional_cols if c in df.columns]
     df = df[keep_cols].copy()
@@ -463,13 +394,13 @@ def stage4_hdbscan() -> HDBSCAN:
     print("STAGE 4:HDBSCAN 聚類設定")
     print("=" * 60)
     hdbscan_model = HDBSCAN(
-        min_cluster_size=10,
-        min_samples=4,
+        min_cluster_size=15,
+        min_samples=8,
         metric="euclidean",
         cluster_selection_method="eom",
         prediction_data=True,
     )
-    print("HDBSCAN:min_cluster_size=10 | min_samples=4 | eom\n")
+    print("HDBSCAN:min_cluster_size=15 | min_samples=8 | eom\n")
     return hdbscan_model
 
 
@@ -881,29 +812,15 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 # =============================================================================
 
 if __name__ == "__main__":
-    # main：只使用 final_label == related
-    # robust：使用 related + weak_related + weak_related_audit
-    SAMPLE_MODE = "robust"
-    # SAMPLE_MODE = "main"
-
-    INPUT_PATH = (
-        "/home/carbon/carbon/data_global_v2/"
-        "Carbon_onlycpc_global_morecpc_v2/"
-        "weighted_relevance_output/"
-        "weighted_related_patents.json"
-    )
-
+    INPUT_PATH = str(PROJECT_DIR / "data_globalmorecpc" / "global_onlycpc_carbon_neutral_v2.json")
     TARGET_TOPICS = None
 
     # STAGE 1:資料載入 + 物理清洗
-    df, abstracts, embedding_texts = stage1_load_and_preprocess(
-        INPUT_PATH,
-        sample_mode=SAMPLE_MODE,
-    )
+    df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)
 
     # STAGE 2:SPECTER2 嵌入(含快取)
     embedding_model, embeddings = stage2_embed(
-        embedding_texts, df, batch_size=32, use_cache=True
+        embedding_texts, df, batch_size=32, use_cache=False
     )
 
     # STAGE 3:UMAP
