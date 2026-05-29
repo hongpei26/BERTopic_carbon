@@ -45,6 +45,8 @@ INPUT_PATH = Path(
 OUTPUT_DIR = INPUT_PATH.parent
 # 最終篩選並純化後的 CSV 輸出路徑
 OUTPUT_CSV = OUTPUT_DIR / "steel_carbonneutral_extracted.csv"
+# 另外輸出 JSON 檔案路徑（格式與原始輸入完全相同）
+OUTPUT_JSON = OUTPUT_DIR / "steel_carbonneutral_extracted.json"
 
 ABSTRACT_FIELD = "abstract_en"   # 主要判定欄位（英文摘要）
 TITLE_FIELD = "title_en"         # 標題欄位（標題會併入摘要文本一起進行特徵分析）
@@ -341,17 +343,23 @@ def main():
     print("負向權重前15:", ", ".join(fn[np.argsort(coef)[:15]]))
 
     # ------------------------------------------------------------------------
-    # STAGE 3: 信心分層、排序與結果數據集導出 (CSV Exporting)
+    # STAGE 3: 信心分層、排序與結果數據集導出 (CSV & JSON Exporting)
     # ------------------------------------------------------------------------
     tier_counter = Counter()
     rows = []
+    # 用於儲存要輸出為 JSON 格式的原始紀錄清單
+    extracted_records = []
     
-    for i in range(N):
+    # 按照相關度機率由高到低，獲取排序索引
+    sorted_indices = np.argsort(-proba)
+    
+    for i in sorted_indices:
         if not relevant[i]:
             continue
         tier = confidence_tier(proba[i])         # 預估機率信心分層
         tier_counter[tier] += 1
         r = keep[i]
+        extracted_records.append(r)              # 保留與輸入格式完全相同的原始 JSON 紀錄字典
         
         # 封裝即將輸出的專利對象
         rows.append({
@@ -367,9 +375,6 @@ def main():
             "abstract_en": r.get("abstract_en", ""),
         })
 
-    # 按相關度機率從高到低排序，便於後續優先審查高相關性專利
-    rows.sort(key=lambda x: -x["relevance_prob"])
-    
     # 定義 CSV 對應的標頭欄位
     fields = ["publication_number", "application_number", "country_code",
               "publication_date", "priority_year", "relevance_prob",
@@ -382,11 +387,16 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
+    # 將提取到的專利以完全相同的原始 JSON 格式導出
+    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(extracted_records, f, ensure_ascii=False, indent=2)
+
     # 輸出最終分類概覽與統計
     print("\n=== 信心分層 ===")
     for k in ["A 高信心", "B 中高信心", "C 中信心", "D 強訊號保底"]:
         print(f"  {k}: {tier_counter.get(k, 0)}")
-    print(f"\n輸出:{OUTPUT_CSV}  共 {len(rows)} 筆")
+    print(f"\n輸出 CSV:{OUTPUT_CSV}  共 {len(rows)} 筆")
+    print(f"輸出 JSON:{OUTPUT_JSON}  共 {len(extracted_records)} 筆")
 
 
 if __name__ == "__main__":
