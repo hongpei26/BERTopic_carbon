@@ -38,6 +38,12 @@
 
 ## 目錄與環境需求
 
+### 套件安裝
+
+```bash
+pip install -r backup_python/requirements.txt
+```
+
 - **輸入/輸出資料夾配置**：腳本內主要預設讀寫資料路徑為 `/home/carbon/carbon/data_global_v2/Carbon_onlycpc_global_morecpc_v2/`，而建模輸出將存於根目錄的 `output_specter2_weighted_keywordtraining/`。
 - **主要依賴套件**：
   - 資料處理：`pandas`, `numpy`, `pyarrow`
