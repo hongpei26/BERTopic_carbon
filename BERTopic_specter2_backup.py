@@ -187,8 +187,12 @@ def stage1_load_and_preprocess(input_path: str, sample_mode: str = "robust"):
                 f"移除 {before - len(df):,} 筆 → 剩餘 {len(df):,} 筆"
             )
 
+        elif sample_mode == "keywordtraining":
+            # keywordtraining 模式不進行 final_label 篩選，直接使用全量數據
+            print(f"樣本模式 keywordtraining：使用全量資料，共 {len(df):,} 筆")
+
         else:
-            raise ValueError("sample_mode must be 'main' or 'robust'")
+            raise ValueError("sample_mode must be 'main', 'robust' or 'keywordtraining'")
     else:
         print("未偵測到 final_label 欄位，將使用全部資料。")
 
@@ -883,15 +887,40 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 if __name__ == "__main__":
     # main：只使用 final_label == related
     # robust：使用 related + weak_related + weak_related_audit
-    SAMPLE_MODE = "robust"
+    # keywordtraining：使用特徵純化後的 steel_carbonneutral_extracted.json 數據
+    SAMPLE_MODE = "keywordtraining"
+    # SAMPLE_MODE = "robust"
     # SAMPLE_MODE = "main"
 
-    INPUT_PATH = (
-        "/home/carbon/carbon/data_global_v2/"
-        "Carbon_onlycpc_global_morecpc_v2/"
-        "weighted_relevance_output/"
-        "weighted_related_patents.json"
-    )
+    if SAMPLE_MODE == "main":
+        OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_main"
+        INPUT_PATH = (
+            "/home/carbon/carbon/data_global_v2/"
+            "Carbon_onlycpc_global_morecpc_v2/"
+            "weighted_relevance_output/"
+            "weighted_related_patents.json"
+        )
+    elif SAMPLE_MODE == "robust":
+        OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_robust"
+        INPUT_PATH = (
+            "/home/carbon/carbon/data_global_v2/"
+            "Carbon_onlycpc_global_morecpc_v2/"
+            "weighted_relevance_output/"
+            "weighted_related_patents.json"
+        )
+    elif SAMPLE_MODE == "keywordtraining":
+        OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_keywordtraining"
+        INPUT_PATH = (
+            "/home/carbon/carbon/data_global_v2/"
+            "Carbon_onlycpc_global_morecpc_v2/"
+            "steel_carbonneutral_extracted.json"
+        )
+    else:
+        raise ValueError(f"未知的 SAMPLE_MODE: {SAMPLE_MODE}")
+
+    # 根據選定的輸出目錄，重新導向快取路徑
+    EMBEDDING_CACHE = OUTPUT_DIR / "specter2_embeddings.npy"
+    EMBEDDING_INDEX = OUTPUT_DIR / "specter2_embeddings_index.parquet"
 
     TARGET_TOPICS = None
 

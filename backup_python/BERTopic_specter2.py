@@ -46,9 +46,8 @@ warnings.filterwarnings("ignore")
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
-# 使用 weighted_related_patents.json 後的新輸出資料夾
-OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_robust"
-# OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_main"
+# 預設輸出資料夾為 keywordtraining 模式
+OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_keywordtraining"
 
 EMBEDDING_CACHE = OUTPUT_DIR / "specter2_embeddings.npy"
 EMBEDDING_INDEX = OUTPUT_DIR / "specter2_embeddings_index.parquet"
@@ -135,7 +134,7 @@ CUSTOM_STOPWORDS = sorted(
 # STAGE 1:資料載入與「物理清洗」(對齊方法論:不做語意閹割)
 # =============================================================================
 
-def stage1_load_and_preprocess(input_path: str, sample_mode: str = "robust"):
+def stage1_load_and_preprocess(input_path: str):
     """
     讀取 JSON / Parquet,僅做物理清洗:
       - HTML entity 解碼
@@ -164,37 +163,6 @@ def stage1_load_and_preprocess(input_path: str, sample_mode: str = "robust"):
             [pd.read_parquet(f) for f in parquet_files], ignore_index=True
         )
     print(f"原始資料筆數:{len(df):,}")
-
-    # ── 1.1.1 依 final_label 選擇樣本口徑 ─────────────────────────────
-    if "final_label" in df.columns:
-        before = len(df)
-
-        if sample_mode == "main":
-            df = df[df["final_label"] == "related"].copy()
-            print(
-                f"樣本模式 main：只保留 related，"
-                f"移除 {before - len(df):,} 筆 → 剩餘 {len(df):,} 筆"
-            )
-
-        elif sample_mode == "robust":
-            df = df[df["final_label"].isin([
-                "related",
-                "weak_related",
-                "weak_related_audit",
-            ])].copy()
-            print(
-                f"樣本模式 robust：保留 related + weak_related + weak_related_audit，"
-                f"移除 {before - len(df):,} 筆 → 剩餘 {len(df):,} 筆"
-            )
-
-        elif sample_mode == "keywordtraining":
-            # keywordtraining 模式不進行 final_label 篩選，直接使用全量數據
-            print(f"樣本模式 keywordtraining：使用全量資料，共 {len(df):,} 筆")
-
-        else:
-            raise ValueError("sample_mode must be 'main', 'robust' or 'keywordtraining'")
-    else:
-        print("未偵測到 final_label 欄位，將使用全部資料。")
 
     # ── 1.2 保留核心欄位 ──────────────────────────────────────────────────
     required_cols = ["application_number", "priority_date", "abstract_en"]
@@ -885,38 +853,13 @@ def stage7_topics_over_time(topic_model, df, abstracts, keywords_df):
 # =============================================================================
 
 if __name__ == "__main__":
-    # main：只使用 final_label == related
-    # robust：使用 related + weak_related + weak_related_audit
     # keywordtraining：使用特徵純化後的 steel_carbonneutral_extracted.json 數據
-    SAMPLE_MODE = "keywordtraining"
-    # SAMPLE_MODE = "robust"
-    # SAMPLE_MODE = "main"
-
-    if SAMPLE_MODE == "main":
-        OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_main"
-        INPUT_PATH = (
-            "/home/carbon/carbon/data_global_v2/"
-            "Carbon_onlycpc_global_morecpc_v2/"
-            "weighted_relevance_output/"
-            "weighted_related_patents.json"
-        )
-    elif SAMPLE_MODE == "robust":
-        OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_related_robust"
-        INPUT_PATH = (
-            "/home/carbon/carbon/data_global_v2/"
-            "Carbon_onlycpc_global_morecpc_v2/"
-            "weighted_relevance_output/"
-            "weighted_related_patents.json"
-        )
-    elif SAMPLE_MODE == "keywordtraining":
-        OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_keywordtraining"
-        INPUT_PATH = (
-            "/home/carbon/carbon/data_global_v2/"
-            "Carbon_onlycpc_global_morecpc_v2/"
-            "steel_carbonneutral_extracted.json"
-        )
-    else:
-        raise ValueError(f"未知的 SAMPLE_MODE: {SAMPLE_MODE}")
+    OUTPUT_DIR = PROJECT_DIR / "output_specter2_weighted_keywordtraining"
+    INPUT_PATH = (
+        "/home/carbon/carbon/data_global_v2/"
+        "Carbon_onlycpc_global_morecpc_v2/"
+        "steel_carbonneutral_extracted.json"
+    )
 
     # 根據選定的輸出目錄，重新導向快取路徑
     EMBEDDING_CACHE = OUTPUT_DIR / "specter2_embeddings.npy"
@@ -925,10 +868,7 @@ if __name__ == "__main__":
     TARGET_TOPICS = None
 
     # STAGE 1:資料載入 + 物理清洗
-    df, abstracts, embedding_texts = stage1_load_and_preprocess(
-        INPUT_PATH,
-        sample_mode=SAMPLE_MODE,
-    )
+    df, abstracts, embedding_texts = stage1_load_and_preprocess(INPUT_PATH)
 
     # STAGE 2:SPECTER2 嵌入(含快取)
     embedding_model, embeddings = stage2_embed(

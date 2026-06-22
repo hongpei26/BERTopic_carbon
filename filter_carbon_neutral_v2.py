@@ -4,8 +4,7 @@ from pathlib import Path
 from collections import Counter
 
 # 設定輸入與輸出路徑
-# CPC 腳本只建立 candidate pool；本腳本才做最終碳中和關鍵字判定。
-src = Path("/home/carbon/carbon/data_globalmorecpc/global_cpc_candidate_pool.json")
+src = Path("/home/carbon/carbon/data_globalmorecpc/global_onlycpc_domain_target_intersection.json")
 out = Path("/home/carbon/carbon/data_globalmorecpc/global_onlycpc_carbon_neutral_v2.json")
 
 
@@ -104,9 +103,8 @@ MEDIUM_RELEVANCE_TERMS = [
     r"steelmaking[-\s]dust",
     r"converter[-\s]dust",
     r"blast[-\s]furnace[-\s]dust",
-    r"dedusting[-\s]ash",
-    r"blast[-\s]furnace[-\s]dedusting[-\s]ash",
     r"iron[-\s]and[-\s]steel[-\s]dust",
+    r"\bdust(?:s)?\b",
     r"blast[-\s]furnace[-\s]gas",
     r"top[-\s]gas",
     r"coke[-\s]oven[-\s]gas",
@@ -115,6 +113,7 @@ MEDIUM_RELEVANCE_TERMS = [
     r"waste[-\s]gas",
     r"exhaust[-\s]gas",
     r"off[-\s]gas",
+    r"\bgas(?:es)?\b",
     r"waste heat",
     r"scrap\b", 
     r"steel scrap"
@@ -127,81 +126,20 @@ ACTION_TERMS = [
     r"recirculat\w*",
     r"reuse", 
     r"utilization",
-    r"energy efficiency",
-    r"thermal efficiency",
-    r"fuel efficiency",
-    r"gas utilization efficiency",
-    r"improve(?:s|d|ing)? gas utilization",
+    r"efficiency", 
     r"reduce (?:emissions?|co2|carbon dioxide|coke rate|carbon consumption|energy consumption)",
-    r"reduce fuel consumption",
-    r"reduce coke rate",
-    r"reduce carbon consumption",
     r"reducing emissions?",
     r"suppress (?:co2|carbon dioxide|emissions?)",
     r"carbonat\w*",
     r"methanat\w*",
     r"sequest\w*",
     r"energy saving", 
-    r"optimiz\w* (?:energy|fuel|gas utilization|combustion|heat recovery)",
+    r"optimization",
     r"preheat\w*",
     r"generate steam",
     r"power generation",
     r"low[-\s]carbon",
     r"green\b"
-]
-
-# 5. 明確減碳/節能/資源循環意圖詞 - Rule B 必須命中
-DECARB_INTENT_TERMS = [
-    r"reduce (?:co2|carbon dioxide|carbon emission|carbon emissions|greenhouse gas|ghg)",
-    r"lower (?:co2|carbon dioxide|carbon emission|carbon emissions|energy consumption|fuel consumption|coke rate|carbon consumption)",
-    r"carbon reduction",
-    r"emission reduction",
-    r"energy saving",
-    r"energy conservation",
-    r"waste heat",
-    r"exhaust heat",
-    r"residual heat",
-    r"heat recovery",
-    r"power generation",
-    r"carbon capture",
-    r"co2 capture",
-    r"carbon sequestration",
-    r"carbonat\w*",
-    r"hydrogen",
-    r"biomass",
-    r"biochar",
-    r"scrap preheat\w*",
-    r"top gas recover\w*",
-    r"gas recover\w*",
-    r"gas recycling",
-    r"slag recycling",
-    r"slag utilization",
-    r"slag carbonat\w*",
-]
-
-# 6. 設備維修/施工排除詞 - 僅在沒有高相關或減碳意圖時排除
-MAINTENANCE_EXCLUSION_TERMS = [
-    r"cooling wall installation",
-    r"cooling wall construction",
-    r"blast furnace construction",
-    r"blast furnace dismantl\w*",
-    r"frame dismantl\w*",
-    r"residual iron cutting",
-    r"residual iron blasting",
-    r"diamond[-\s]wire saw",
-    r"tuyere sleeve remov\w*",
-    r"tuyere jacket replac\w*",
-    r"taphole repair",
-    r"main ditch repair",
-    r"stemming filling",
-    r"anhydrous stemming",
-    r"refractory casting mold",
-    r"lining construction",
-    r"overhaul",
-    r"maintenance method",
-    r"construction method",
-    r"installation device",
-    r"dismantling method",
 ]
 
 # 編譯正規表示式
@@ -224,8 +162,6 @@ exclude_patterns, exclude_labels = compile_patterns(EXCLUSION_TERMS)
 high_patterns, high_labels = compile_patterns(HIGH_RELEVANCE_TERMS)
 medium_patterns, medium_labels = compile_patterns(MEDIUM_RELEVANCE_TERMS)
 action_patterns, action_labels = compile_patterns(ACTION_TERMS)
-decarb_patterns, decarb_labels = compile_patterns(DECARB_INTENT_TERMS)
-maintenance_patterns, maintenance_labels = compile_patterns(MAINTENANCE_EXCLUSION_TERMS)
 
 def get_matched_terms(text, patterns, terms):
     matched = []
@@ -240,19 +176,16 @@ records = json.loads(src.read_text(encoding="utf-8"))
 filtered_records = []
 stats = {
     "total": len(records),
-    "noise_product_material": 0,
-    "noise_maintenance": 0,
+    "noise_excluded": 0,
     "rule_a_high": 0,
-    "rule_b_medium_action_intent": 0,
+    "rule_b_medium_action": 0,
     "unmatched": 0
 }
 
 high_counter = Counter()
 medium_counter = Counter()
 action_counter = Counter()
-decarb_counter = Counter()
 exclusion_counter = Counter()
-maintenance_counter = Counter()
 
 print("開始篩選...")
 for record in records:
@@ -267,48 +200,38 @@ for record in records:
     # 檢查中度與動作詞
     medium_hits = get_matched_terms(text, medium_patterns, medium_labels)
     action_hits = get_matched_terms(text, action_patterns, action_labels)
-    decarb_intent_hits = get_matched_terms(text, decarb_patterns, decarb_labels)
-    maintenance_hits = get_matched_terms(text, maintenance_patterns, maintenance_labels)
     
     # 規則邏輯判斷
     matched_rule = None
     
     if exclude_hits and not high_hits:
         # 如果命中排除詞（如低碳鋼產品），且沒有任何高相關技術（如DRI），則視為雜訊
-        matched_rule = "Noise_Product_Material"
-        stats["noise_product_material"] += 1
+        matched_rule = "Noise"
+        stats["noise_excluded"] += 1
         exclusion_counter.update(exclude_hits)
-    elif maintenance_hits and not high_hits and not decarb_intent_hits:
-        # 如果只是維修/施工，且沒有高相關或明確減碳意圖，則視為雜訊
-        matched_rule = "Noise_Maintenance"
-        stats["noise_maintenance"] += 1
-        maintenance_counter.update(maintenance_hits)
     elif high_hits:
         # 命中高相關詞（原生低碳路徑或已組裝好雙向特徵的短語），直接保留
-        matched_rule = "Rule_A_High"
+        matched_rule = "Rule_A"
         stats["rule_a_high"] += 1
         high_counter.update(high_hits)
-    elif medium_hits and action_hits and decarb_intent_hits:
-        # 命中中度場域詞 + 技術動作詞 + 明確減碳/節能/資源循環意圖詞
-        matched_rule = "Rule_B_Medium_Action_Intent"
-        stats["rule_b_medium_action_intent"] += 1
+    elif medium_hits and action_hits:
+        # 命中中度相關詞（設備名、廣義渣/氣），且同時有回收/優化/減排等動作詞
+        matched_rule = "Rule_B"
+        stats["rule_b_medium_action"] += 1
         medium_counter.update(medium_hits)
         action_counter.update(action_hits)
-        decarb_counter.update(decarb_intent_hits)
     else:
         # 無法歸類，視為不相關
         stats["unmatched"] += 1
         
-    if matched_rule in ["Rule_A_High", "Rule_B_Medium_Action_Intent"]:
+    if matched_rule in ["Rule_A", "Rule_B"]:
         output_record = dict(record)
         output_record["carbon_neutral_rule"] = matched_rule
         # 對標籤進行 list(set()) 去重，維持 Metadata 的乾淨度
         output_record["high_relevance_hits"] = list(set(high_hits))
         output_record["medium_relevance_hits"] = list(set(medium_hits))
         output_record["action_hits"] = list(set(action_hits))
-        output_record["decarb_intent_hits"] = list(set(decarb_intent_hits))
         output_record["exclude_hits"] = list(set(exclude_hits))
-        output_record["maintenance_hits"] = list(set(maintenance_hits))
         filtered_records.append(output_record)
 
 print("寫入輸出檔案...")
@@ -321,11 +244,10 @@ out.write_text(
 # 列印統計結果
 print("\n=== 鋼鐵業碳中和關鍵字篩選 V2 最終精確版結果 ===")
 print(f"輸入總筆數：{stats['total']:,}")
-print(f"因命中排除詞(如材料配方)而剔除的雜訊筆數：{stats['noise_product_material']:,}")
-print(f"因命中維修/施工排除詞而剔除的雜訊筆數：{stats['noise_maintenance']:,}")
+print(f"因命中排除詞(如材料配方)而剔除的雜訊筆數：{stats['noise_excluded']:,}")
 print(f"因未命中任何規則而未納入的筆數：{stats['unmatched']:,}")
 print(f"規則 A (純原生低碳技術) 納入：{stats['rule_a_high']:,}")
-print(f"規則 B (設備特徵 + 動作 + 減碳意圖) 納入：{stats['rule_b_medium_action_intent']:,}")
+print(f"規則 B (設備特徵 + 減碳節能動作) 納入：{stats['rule_b_medium_action']:,}")
 print(f"最後輸出筆數：{len(filtered_records):,}")
 print(f"輸出檔案：{out}")
 print("====================================")
@@ -338,6 +260,4 @@ def print_top(counter, title, limit=10):
 print_top(high_counter, "高度相關詞命中 Top 10")
 print_top(medium_counter, "中度相關詞命中 Top 10")
 print_top(action_counter, "動作/目的詞命中 Top 10")
-print_top(decarb_counter, "減碳意圖詞命中 Top 10")
 print_top(exclusion_counter, "排除雜訊詞命中 Top 10")
-print_top(maintenance_counter, "維修/施工排除詞命中 Top 10")
