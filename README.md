@@ -1,12 +1,12 @@
-# 碳捕捉與鋼鐵業減碳專利分析 Pipeline (`berttopic_carbon`)
+# 碳捕捉與鋼鐵業減碳專利分析
 
-## 📌 專案簡介 (Overview)
+## 專案簡介 (Overview)
 
 本專案建立了一套高精度、端到端的巨量專利資料處理與 AI 分析管線（Pipeline），專注於「**鋼鐵產業碳中和與減碳技術**」領域。整個資料科學流程從全球專利資料庫的跨國去重開始，經過 CPC 分類碼雙群組交集篩選、弱監督機器學習 (Logistic Regression) 特徵萃取，最終進入以 SPECTER2 + BERTopic 為核心的動態主題建模與趨勢分析 (Topics over Time)，全面解析 2006 至 2025 年間全球鋼鐵減碳技術的演進軌跡與發展趨勢。
 
 ---
 
-## 🌟 核心特色 (Core Features)
+## 核心特色 (Core Features)
 
 1. **多重階層式專利去重機制 (Multi-Level Deduplication)**
    - 整合申請號 (`application_number`)、跨國同族專利 (`family_id`) 與英文摘要文本 (`abstract_en`) 三階段去重，結合國家優先權偏好 (US/WO/EP/CA 等) 與摘要品質評分，避免同一技術重複採樣造成的權重偏差與頻率失真。
@@ -24,20 +24,33 @@
 ---
 
 
-## 📁 目錄結構 (Directory Structure)
+## 目錄結構 (Directory Structure)
 
-`berttopic_carbon/`
-├── `dedup_application_number_more.py`    # 階段一 (1.1)：依申請號 (application_number) 去重
-├── `dedup_family_id.py`                 # 階段一 (1.2)：依專利族 (family_id) 跨國同族去重
-├── `dedup_abs.py`                       # 階段一 (1.3)：依英文摘要 (abstract_en) 文本去重
-├── `filter_domain_target_cpc_nokeyword.py` # 階段二：CPC 鋼鐵場域 & 減碳目標雙群組交集與時間 (2006-2025) 篩選
-├── `keyword_v3.py`                      # 階段三：雙層弱監督機器學習 (Rules + TF-IDF + Logistic Regression) 關鍵字萃取
-├── `BERTopic_specter2.py`              # 階段四：7-Stage SPECTER2 + BERTopic 動態主題建模與趨勢演進分析
-└── `requirements.txt`                   # 專案依賴套件清單
+```text
+berttopic_carbon/
+├── dedup_application_number_more.py        # 階段一 (1.1)：申請號去重
+├── dedup_family_id.py                     # 階段一 (1.2)：專利族跨國去重
+├── dedup_abs.py                            # 階段一 (1.3)：摘要文本去重
+├── filter_domain_target_cpc_nokeyword.py     # 階段二：CPC 鋼鐵與減碳目標過濾 (2006-2025)
+├── keyword_v3.py                          # 階段三：弱監督 ML 關鍵字萃取
+├── BERTopic_specter2.py                  # 階段四：SPECTER2 + BERTopic 主題建模
+└── requirements.txt                       # 專案依賴套件清單
+```
+
+| 檔案名稱 | 階段 | 主要功能說明 |
+| :--- | :--- | :--- |
+| [`dedup_application_number_more.py`](file:///home/carbon/carbon/berttopic_carbon/dedup_application_number_more.py) | 階段 1.1 | 依 `application_number`（申請號）與最早日期去重 |
+| [`dedup_family_id.py`](file:///home/carbon/carbon/berttopic_carbon/dedup_family_id.py) | 階段 1.2 | 依 `family_id`（專利族）跨國同族公開案去重 |
+| [`dedup_abs.py`](file:///home/carbon/carbon/berttopic_carbon/dedup_abs.py) | 階段 1.3 | 依 `abstract_en`（英文摘要）文字精確去重 |
+| [`filter_domain_target_cpc_nokeyword.py`](file:///home/carbon/carbon/berttopic_carbon/filter_domain_target_cpc_nokeyword.py) | 階段 2 | CPC 鋼鐵場域 (`C21B`/`C21C`) 與減碳目標交集過濾 (2006–2025) |
+| [`keyword_v3.py`](file:///home/carbon/carbon/berttopic_carbon/keyword_v3.py) | 階段 3 | 雙層弱監督機器學習 (Rules + TF-IDF + Logistic Regression) |
+| [`BERTopic_specter2.py`](file:///home/carbon/carbon/berttopic_carbon/bertopic_specter2.py) | 階段 4 | 7-Stage SPECTER2 + BERTopic 動態主題建模與趨勢分析 |
+| [`requirements.txt`](file:///home/carbon/carbon/berttopic_carbon/requirements.txt) | 環境依賴 | 專案 Python 套件依賴清單 |
 
 ---
 
-## 🔄 執行流程 (Pipeline Workflow)
+
+## 執行流程 (Pipeline Workflow)
 
 完整資料處理與建模流程分為四大階段，各腳本需依序執行：
 
@@ -102,7 +115,7 @@
 
 ---
 
-## 🛠️ 目錄與環境需求 (Environment Setup)
+## 目錄與環境需求 (Environment Setup)
 
 ### 套件安裝
 
